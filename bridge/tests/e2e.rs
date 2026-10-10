@@ -32,6 +32,7 @@ use zcash_protocol::{
 };
 use zflip_bridge::{apply_signatures, sign_request};
 use zflip_core::{
+    protocol,
     Account, Network,
     request::{self, Owner, SignRequest},
     sign::{self, Error},
@@ -174,6 +175,53 @@ fn payment_pczt(from: &Account, to: orchard::Address, amount: u64, pool: Pool) -
         .unwrap()
 }
 
+
+/// `from` spends a 1 ZEC note and pays each of `to` in one transaction (a multisend), keeping
+/// the change. ZIP 317: one logical action per output here, at least two.
+fn multi_payment_pczt(from: &Account, to: &[(orchard::Address, u64)], pool: Pool) -> (Pczt, u64) {
+    let fvk = from.fvk().clone();
+    let (note, anchor, path) = received_note(&fvk, pool, 100_000_000);
+    let (orchard_anchor, ironwood_anchor) = match pool {
+        Pool::Orchard => (Some(anchor), None),
+        Pool::Ironwood => (None, Some(anchor)),
+    };
+    let mut builder = Builder::new(
+        network(pool),
+        10_000_000.into(),
+        BuildConfig::Standard {
+            sapling_anchor: None,
+            orchard_anchor,
+            ironwood_anchor,
+            orchard_padding: BundlePadding::DEFAULT,
+            ironwood_padding: BundlePadding::DEFAULT,
+        },
+    );
+    let ovk = Some(fvk.to_ovk(Scope::External));
+    let change_ovk = Some(fvk.to_ovk(Scope::Internal));
+    let change_addr = fvk.address_at(0u32, Scope::Internal);
+    let fee = 5_000 * (to.len() as u64 + 1).max(2);
+    let paid: u64 = to.iter().map(|(_, v)| v).sum();
+    let change = Zatoshis::const_from_u64(100_000_000 - paid - fee);
+    match pool {
+        Pool::Orchard => {
+            builder.add_orchard_spend::<zip317::FeeRule>(fvk.clone(), note, path).unwrap();
+            for (addr, v) in to {
+                builder.add_orchard_output::<zip317::FeeRule>(ovk.clone(), *addr, Zatoshis::const_from_u64(*v), MemoBytes::empty()).unwrap();
+            }
+            builder.add_orchard_output::<zip317::FeeRule>(change_ovk, change_addr, change, MemoBytes::empty()).unwrap();
+        }
+        Pool::Ironwood => {
+            builder.add_ironwood_spend::<zip317::FeeRule>(fvk.clone(), note, path).unwrap();
+            for (addr, v) in to {
+                builder.add_ironwood_output::<zip317::FeeRule>(ovk.clone(), *addr, Zatoshis::const_from_u64(*v), MemoBytes::empty()).unwrap();
+            }
+            builder.add_ironwood_output::<zip317::FeeRule>(change_ovk, change_addr, change, MemoBytes::empty()).unwrap();
+        }
+    }
+    let PcztResult { pczt_parts, .. } = builder.build_for_pczt(OsRng, &zip317::FeeRule::standard()).unwrap();
+    let pczt = IoFinalizer::new(Creator::build_from_parts(pczt_parts).unwrap()).finalize_io().unwrap();
+    (pczt, fee)
+}
 
 /// What the iOS SDK's `redactPCZTForSigner` leaves: no proof, witnesses or wire FVKs.
 fn redact_for_signer(pczt: Pczt) -> Pczt {
@@ -404,5 +452,36 @@ fn bridge_addresses_match_the_device() {
     let alice = account(1);
     for j in [0u32, 1, 9] {
         assert_eq!(zflip_bridge::address(&alice.ufvk(), j).unwrap(), alice.encode_address(j));
+    }
+}
+
+#[test]
+fn multisend_reviews_every_payment_and_signs_once() {
+    let alice = account(1);
+    for n in [1usize, 2, 5, 10] {
+        let to: Vec<(orchard::Address, u64)> = (0..n).map(|i| (account(20 + i as u8).address(i as u32), 1_000_000 * (i as u64 + 1))).collect();
+        let (pczt, fee) = multi_payment_pczt(&alice, &to, Pool::Ironwood);
+        let req = request_for(&pczt, &alice);
+        let wire = protocol::encode(protocol::msg::SIGN, &req.encode()).len();
+        let actions: usize = req.bundles.iter().map(|b| b.actions.len()).sum();
+        println!("multisend {n:>2} recipients: {actions:>2} actions, sign request {wire:>6} bytes on the wire");
+
+        let review = sign::review(&req, &alice).unwrap();
+        assert_eq!(review.payments.len(), n);
+        // The builder shuffles outputs (on purpose): compare as sets.
+        let mut got: Vec<(u64, String)> = review.payments.iter().map(|p| (p.value, p.address.clone())).collect();
+        let mut want: Vec<(u64, String)> =
+            to.iter().map(|(a, v)| (*v, zflip_core::account::encode_orchard_address(alice.network(), a))).collect();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
+        assert_eq!(review.fee, fee);
+
+        // One spent note: one signature, however many recipients.
+        let sigs = sign::sign(&req, &alice, OsRng).unwrap();
+        assert_eq!(sigs.len(), 1);
+        let signed = Pczt::parse(&apply_signatures(&bytes(&pczt), &sigs).unwrap()).unwrap();
+        let proven = Prover::new(signed).create_ironwood_proof(proving_key(Pool::Ironwood)).unwrap().finish();
+        TransactionExtractor::new(proven).extract().unwrap();
     }
 }

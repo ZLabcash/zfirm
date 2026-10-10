@@ -120,9 +120,18 @@ impl Decoder {
             return Err(DecodeError::TooLarge);
         }
         if self.buf.len() < HEADER_LEN + len {
+            // Room for exactly this frame, once: letting the Vec double would briefly need
+            // twice a sign request's size, more than a Flipper app has to spare.
+            self.buf.reserve_exact(HEADER_LEN + len - self.buf.len());
             return Ok(None);
         }
         let kind = self.buf[2];
+        if self.buf.len() == HEADER_LEN + len {
+            // The usual case: the buffer holds just this frame. Hand it over without a copy.
+            let mut payload = core::mem::take(&mut self.buf);
+            payload.drain(..HEADER_LEN);
+            return Ok(Some(Frame { kind, payload }));
+        }
         let payload = self.buf[HEADER_LEN..HEADER_LEN + len].to_vec();
         self.buf.drain(..HEADER_LEN + len);
         Ok(Some(Frame { kind, payload }))

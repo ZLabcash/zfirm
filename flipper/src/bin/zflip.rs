@@ -750,7 +750,10 @@ fn draw(g: &Gfx, s: &State) {
                 // review (it must be ours) and needs no line of its own.
                 g.title("Confirm");
                 g.font(Font::Small);
-                g.text(2, 22, "Payment");
+                // Several recipients: their sum, each one having had its own page.
+                let n = r.payments.len();
+                let label = if n > 1 { ["Payments (", &gfx::num(n as u64), ")"].concat() } else { "Payment".into() };
+                g.text(2, 22, &label);
                 g.right(126, 22, &zec(r.total_out() - r.fee));
                 g.text(2, 33, "Fee");
                 g.right(126, 33, &zec(r.fee));
