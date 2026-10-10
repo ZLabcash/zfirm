@@ -1,0 +1,7 @@
+target/
+flipper/target/
+flipper/dist/
+dolphin/.cache/
+dolphin/dist/
+__pycache__/
+.DS_Store

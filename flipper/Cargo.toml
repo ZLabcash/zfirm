@@ -1,0 +1,63 @@
+[package]
+name = "zflip"
+version = "0.1.0"
+edition = "2024"
+description = "ZFlip: Zcash shielded wallet for Flipper Zero"
+license = "MIT OR Apache-2.0"
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[[bin]]
+name = "zflip"
+path = "src/bin/zflip.rs"
+bench = false
+test = false
+
+[[bin]]
+name = "zflip_setup"
+path = "src/bin/zflip_setup.rs"
+bench = false
+test = false
+
+# Development only: times the crypto primitives on the device (see tools/).
+[[bin]]
+name = "zflip_bench"
+path = "src/bin/zflip_bench.rs"
+bench = false
+test = false
+
+[dependencies]
+flipperzero = { version = "0.15.0", features = ["alloc"] }
+flipperzero-alloc = "0.15.0"
+flipperzero-rt = "0.15.0"
+flipperzero-sys = "0.15.0"
+aes = { version = "0.8", default-features = false }
+orchard = { version = "0.15", default-features = false }
+pasta_curves = { version = "0.5", default-features = false, features = ["alloc"] }
+qrcodegen-no-heap = "1.8"
+blake2b_simd = { version = "1", default-features = false, features = ["uninline_portable"] }
+sinsemilla = "0.1"
+rand_core = { version = "0.6", default-features = false }
+zflip-core = { path = "../core" }
+
+[patch.crates-io]
+pasta_curves = { path = "../vendor/pasta_curves" }
+sinsemilla = { path = "../vendor/sinsemilla" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.dev]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[workspace]

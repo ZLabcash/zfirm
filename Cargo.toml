@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["core", "bridge"]
+exclude = ["flipper", "vendor"]
+
+# Device builds need Sinsemilla without its 64 KiB generator table and pasta_curves
+# without its 29 KiB sqrt tables (see vendor/): a Flipper app lives in ~100 KiB of RAM.
+[patch.crates-io]
+pasta_curves = { path = "vendor/pasta_curves" }
+sinsemilla = { path = "vendor/sinsemilla" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"

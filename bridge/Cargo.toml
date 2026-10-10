@@ -1,0 +1,29 @@
+[package]
+name = "zflip-bridge"
+version = "0.1.0"
+edition = "2024"
+description = "Phone-side glue for ZFlip: PCZT -> device sign request, device signatures -> PCZT"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+orchard = { version = "0.15", default-features = false, features = ["std"] }
+pasta_curves = "0.5"
+pczt = { version = "0.9.3", default-features = false, features = ["std", "orchard", "signer"] }
+zcash_address = "0.13"
+zcash_keys = { version = "0.16", features = ["orchard"] }
+zcash_protocol = "0.10"
+zflip-core = { path = "../core" }
+
+[dev-dependencies]
+incrementalmerkletree = "0.8"
+orchard = { version = "0.15", features = ["circuit"] }
+pczt = { version = "0.9.3", features = ["io-finalizer", "prover", "signer", "tx-extractor", "zcp-builder"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+shardtree = "0.6"
+zcash_note_encryption = "0.4"
+zcash_primitives = "0.30"
+zcash_protocol = { version = "0.10", features = ["local-consensus"] }
+zip32 = "0.2"
