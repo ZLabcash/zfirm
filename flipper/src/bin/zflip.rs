@@ -746,14 +746,17 @@ fn draw(g: &Gfx, s: &State) {
                 g.wrapped(1, 33, &p.address, 21, 0, 3);
                 g.hints("< >", "OK: next");
             } else {
+                // What leaves the wallet, plainly. The change coming back was checked in the
+                // review (it must be ours) and needs no line of its own.
                 g.title("Confirm");
                 g.font(Font::Small);
-                g.text(2, 22, "Fee");
-                g.right(126, 22, &zec(r.fee));
-                g.text(2, 33, "Total out");
-                g.right(126, 33, &zec(r.total_out()));
-                g.text(2, 44, "Back to you");
-                g.right(126, 44, &zec(r.change + r.to_self));
+                g.text(2, 22, "Payment");
+                g.right(126, 22, &zec(r.total_out() - r.fee));
+                g.text(2, 33, "Fee");
+                g.right(126, 33, &zec(r.fee));
+                g.line(2, 37, 126, 37);
+                g.text(2, 47, "Total");
+                g.right(126, 47, &zec(r.total_out()));
                 g.hints("Back: refuse", "Hold OK: sign");
             }
         }
