@@ -1,0 +1,11 @@
+[package]
+name = "blake2b_simd"
+version = "1.0.5"
+edition = "2021"
+description = "ZFlip: a compact, portable BLAKE2b with the blake2b_simd API subset Zcash crates use (about 1 KiB of code instead of 6)"
+license = "MIT"
+
+[features]
+default = ["std"]
+std = []
+uninline_portable = []

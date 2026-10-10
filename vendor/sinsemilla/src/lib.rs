@@ -231,8 +231,10 @@ pub struct CommitDomain {
 impl CommitDomain {
     /// Constructs a new `CommitDomain` with a specific prefix string.
     pub fn new(domain: &str) -> Self {
-        let m_prefix = format!("{}-M", domain);
-        let r_prefix = format!("{}-r", domain);
+        // Concatenated by hand: `format!` would pull ~3 KiB of core::fmt into a
+        // Flipper app.
+        let m_prefix = [domain, "-M"].concat();
+        let r_prefix = [domain, "-r"].concat();
         let hasher_r = pallas::Point::hash_to_curve(&r_prefix);
         CommitDomain {
             M: HashDomain::new(&m_prefix),

@@ -45,6 +45,7 @@ zflip-core = { path = "../core" }
 [patch.crates-io]
 pasta_curves = { path = "../vendor/pasta_curves" }
 sinsemilla = { path = "../vendor/sinsemilla" }
+blake2b_simd = { path = "../vendor/blake2b_simd" }
 
 [profile.release]
 opt-level = "z"
