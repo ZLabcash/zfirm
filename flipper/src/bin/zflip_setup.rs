@@ -384,7 +384,10 @@ fn pin_entered(s: &mut State, worker: &mut Worker<Job>, purpose: PinFor, pin: Ve
         PinFor::Confirm => {
             let entropy = seed::entropy_of(&core::mem::take(&mut s.indices));
             // A new seed's birthday is now; a restored one is unknown.
-            let created_at = if s.restored { 0 } else { unsafe { flipperzero_sys::furi_hal_rtc_get_timestamp() } };
+            // A clock that was never set reads years in the past, and the phone would
+            // then scan the whole chain: no ZFlip wallet predates ZFlip itself.
+            let now = unsafe { flipperzero_sys::furi_hal_rtc_get_timestamp() };
+            let created_at = if s.restored { 0 } else { now.max(ZFLIP_EPOCH) };
             s.page_words.clear();
             s.new_pin.clear();
             s.screen = Screen::Busy("Forging wallet");
@@ -428,6 +431,9 @@ fn pin_entered(s: &mut State, worker: &mut Worker<Job>, purpose: PinFor, pin: Ve
 }
 
 /// Derives the account (seed, ZIP 32, viewing keys) and seals it with `pin`.
+/// 2026-10-01 00:00 UTC, before the first ZFlip wallet.
+const ZFLIP_EPOCH: u32 = 1_790_812_800;
+
 fn create(entropy: &[u8], network: Network, created_at: u32, pin: &[u8]) -> Result<(), vault::Error> {
     let account = seed::open_account(entropy, network).ok_or(vault::Error::Missing)?;
     let change = stable::with(|| account.address_in(orchard::keys::Scope::Internal, 0)).to_raw_address_bytes();
