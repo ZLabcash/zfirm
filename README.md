@@ -1,7 +1,7 @@
 # ZFlip
 
 A Zcash shielded wallet for the Flipper Zero. The Flipper holds the seed and signs;
-the phone app ([zapp](https://github.com/adamzkdev/zapp)) holds the viewing key,
+the phone app ([zapp](https://github.com/Zfactorycash/zapp)) holds the viewing key,
 syncs, builds transactions and proofs, and broadcasts. They talk over Bluetooth.
 
 - `core/`: no_std signer core (ZIP 32, Orchard/Ironwood, unified addresses, BIP 39,
