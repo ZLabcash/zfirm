@@ -157,6 +157,16 @@ pub struct SigningKey {
     change: [u8; 43],
 }
 
+impl Drop for SigningKey {
+    /// Wipes the spending key from RAM once the wallet is locked or the app exits.
+    fn drop(&mut self) {
+        const _: () = assert!(core::mem::size_of::<SpendingKey>() == 32);
+        // SAFETY: `SpendingKey` is 32 plain bytes and is never read again.
+        unsafe { core::ptr::write_volatile(&mut self.sk as *mut SpendingKey as *mut [u8; 32], [0; 32]) };
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl SigningKey {
     pub fn from_parts(network: Network, sk: [u8; 32], seed_fp: [u8; 32], change: [u8; 43]) -> Option<Self> {
         let sk = Option::from(SpendingKey::from_bytes(sk))?;

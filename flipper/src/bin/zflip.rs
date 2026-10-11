@@ -45,7 +45,6 @@ use flipperzero::{
 use flipperzero_rt::{entry, manifest};
 use flipperzero_sys as sys;
 use zfirm_core::{
-    Network,
     account::SigningKey,
     protocol::{self, Decoder, Info, error, msg},
     request::SpendSignature,
@@ -61,17 +60,10 @@ use crate::{
 manifest!(name = "ZFlip", app_version = 2, has_icon = true, icon = "../zflip.icon", stack_size = 4096);
 entry!(main);
 
-/// The whole zkSNARKs collection: 10,000 × 169 bytes (26×26 portraits, 2 bits per
-/// pixel: off / dithered / ink), built by dolphin/pack_all.py.
-const SNARKS_PATH: &CStr = c"/ext/apps_data/zflip/snarks.bin";
-const SNARK_RECORD: usize = 169;
-const SNARKS: u16 = 10_000;
-const HOME: [&str; 3] = ["Receive", "Collections", "Settings"];
+const HOME: [&str; 2] = ["Receive", "Settings"];
 /// With a Wi-Fi board answering, the network gets its own entry.
-const HOME_WIFI: [&str; 4] = ["Receive", "Network", "Collections", "Settings"];
-/// NFT collections viewable on the Flipper (one so far).
-const COLLECTIONS: [&str; 1] = ["zkSNARKs"];
-const SETTINGS: [&str; 6] = ["Recovery words", "Viewing key", "Change PIN", "Network", "Lock", "Wipe wallet"];
+const HOME_WIFI: [&str; 3] = ["Receive", "Blockchain", "Settings"];
+const SETTINGS: [&str; 6] = ["Recovery words", "Viewing key", "Change PIN", "Wi-Fi network", "Lock", "Wipe wallet"];
 /// Settings rows that fit under the title bar.
 const SETTINGS_ROWS: u8 = 5;
 
@@ -81,8 +73,6 @@ enum Screen {
     Busy(&'static str),
     Home(u8),
     Receive { text: bool },
-    Collections(u8),
-    Gallery,
     Settings(u8),
     Wipe,
     PairPrompt,
@@ -93,6 +83,10 @@ enum Screen {
     Track,
     /// The network and the ZEC price (with the Wi-Fi board).
     Network,
+    /// "A Wi-Fi board is plugged in: let it go online?"
+    WifiPrompt,
+    /// The viewing key, as a QR code or as text (scrolled by `line`).
+    ViewKey { text: bool, line: u8 },
 }
 
 /// The last signed transaction, followed through the Wi-Fi board.
@@ -119,17 +113,13 @@ struct State {
     address: Option<(u32, String, Option<Qr>)>,
     /// Derives receiving addresses; set at unlock.
     ivk: Option<Arc<orchard::keys::IncomingViewingKey>>,
-    /// Gallery: the zkSNARK shown, its portrait, autoplay and speed.
-    snark: u16,
-    snark_pixels: Option<[u8; SNARK_RECORD]>,
-    playing: bool,
-    fast: bool,
-    last_step: u32,
     /// The Wi-Fi board's network, `None` when no board answers.
     wifi: Option<wifi::Net>,
     track: Option<Track>,
     price: Option<wifi::Price>,
     network: Option<wifi::NetInfo>,
+    /// The viewing key and its QR code, while shown.
+    ufvk: Option<(String, Option<Qr>)>,
 }
 
 enum Job {
@@ -137,6 +127,7 @@ enum Job {
     Address(u32, String, Option<Qr>),
     Reviewed(Result<Review, sign::Error>),
     Signed(Result<Vec<SpendSignature>, sign::Error>, Option<[u8; 32]>),
+    ViewKey(String, Option<Qr>),
 }
 
 struct Session {
@@ -151,6 +142,12 @@ struct Session {
     board_hello: u32,
     /// Tick of the last price and network questions.
     board_market: u32,
+    /// A board answered since it was powered.
+    board_seen: bool,
+    /// The user's answer to the Wi-Fi prompt, for this run of the app.
+    board_allowed: Option<bool>,
+    /// The saved network was handed over and not yet acknowledged.
+    board_wifi_sent: bool,
 }
 
 /// What the shared session needs to know about this Flipper's wallet.
@@ -174,33 +171,7 @@ fn main(_args: Option<&CStr>) -> i32 {
     }
     // First, while the heap is still in one piece: the worker's stack.
     let mut worker = Worker::new(10 * 1024);
-    let shell = Shell::new(
-        State {
-            screen: Screen::Pin,
-            resume: Screen::Home(0),
-            frame: 0,
-            meta: None,
-            account: None,
-            pin: PinPad::new(),
-            note: "",
-            connected: false,
-            paired: false,
-            review: None,
-            index: 0,
-            address: None,
-            ivk: None,
-            snark: 1,
-            snark_pixels: None,
-            playing: true,
-            fast: false,
-            last_step: 0,
-            wifi: None,
-            track: None,
-            price: None,
-            network: None,
-        },
-        draw,
-    );
+    let shell = Shell::new(new_state(), draw);
     let mut session = Session {
         link: None,
         decoder: Decoder::new(),
@@ -210,6 +181,9 @@ fn main(_args: Option<&CStr>) -> i32 {
         board_heard: 0,
         board_hello: 0,
         board_market: 0,
+        board_seen: false,
+        board_allowed: None,
+        board_wifi_sent: false,
     };
     loop {
         let key = shell.next_key();
@@ -218,17 +192,7 @@ fn main(_args: Option<&CStr>) -> i32 {
         }
         poll_link(&shell, &mut worker, &mut session);
         poll_board(&shell, &mut session);
-        {
-            let mut s = shell.state.lock();
-            s.frame += 1;
-            if s.screen == Screen::Gallery && s.playing {
-                let now = unsafe { sys::furi_get_tick() };
-                if now.wrapping_sub(s.last_step) >= if s.fast { 250 } else { 1200 } {
-                    let next = if s.snark >= SNARKS { 1 } else { s.snark + 1 };
-                    show_snark(&mut s, next);
-                }
-            }
-        }
+        shell.state.lock().frame += 1;
         let Some(k) = key else { continue };
         if worker.busy() {
             continue;
@@ -240,7 +204,31 @@ fn main(_args: Option<&CStr>) -> i32 {
     worker.wait();
     session.link = None;
     session.board = None;
+    shell.clear(new_state());
     0
+}
+
+fn new_state() -> State {
+    State {
+        screen: Screen::Pin,
+        resume: Screen::Home(0),
+        frame: 0,
+        meta: None,
+        account: None,
+        pin: PinPad::new(),
+        note: "",
+        connected: false,
+        paired: false,
+        review: None,
+        index: 0,
+        address: None,
+        ivk: None,
+        wifi: None,
+        track: None,
+        price: None,
+        network: None,
+        ufvk: None,
+    }
 }
 
 /// How long a Wi-Fi board gets to answer after power-up (it boots in about a second).
@@ -257,7 +245,9 @@ const MARKET_EVERY_MS: u32 = 60_000;
 /// Powers the GPIO header and looks for a Wi-Fi board for a few seconds; without
 /// one, ZFlip carries on exactly as before.
 fn probe_board(session: &mut Session) {
-    if session.board.is_none() {
+    // Refused once: not again until ZFlip is opened again.
+    if session.board.is_none() && session.board_allowed != Some(false) {
+        session.board_seen = false;
         session.board = wifi::Board::open();
         session.board_probe_until = unsafe { sys::furi_get_tick() }.wrapping_add(BOARD_PROBE_MS);
         session.board_hello = 0;
@@ -268,13 +258,19 @@ fn poll_board(shell: &Shell<State>, session: &mut Session) {
     let Some(board) = session.board.as_mut() else { return };
     let now = unsafe { sys::furi_get_tick() };
     let mut s = shell.state.lock();
+    let allowed = session.board_allowed == Some(true);
     while let Some(reply) = board.poll() {
         session.board_heard = now;
+        session.board_seen = true;
+        if !allowed {
+            // Nothing goes to the board, and nothing it says is used, until the user agrees.
+            continue;
+        }
         match reply {
             wifi::Reply::Hello(net) => {
-                // A board without a network gets the one saved on the SD card.
-                if net == wifi::Net::NoWifi && s.wifi.is_none() {
-                    board.send_wifi();
+                // The saved network goes to a board that has none, or a newer one.
+                if (net == wifi::Net::NoWifi || wifi::network_pending()) && !session.board_wifi_sent {
+                    session.board_wifi_sent = board.send_wifi();
                 }
                 s.wifi = Some(net);
             }
@@ -283,31 +279,48 @@ fn poll_board(shell: &Shell<State>, session: &mut Session) {
                     t.tx = tx;
                 }
             }
-            wifi::Reply::WifiSaved => s.wifi = Some(wifi::Net::Connecting),
+            wifi::Reply::WifiSaved => {
+                wifi::network_delivered();
+                s.wifi = Some(wifi::Net::Connecting);
+            }
             wifi::Reply::Price(p) => s.price = Some(p),
             wifi::Reply::Net(n) => s.network = Some(n),
         }
     }
-    let present = s.wifi.is_some();
+    let present = session.board_seen;
+    // Ask once a board answers, when nothing else is on screen.
+    let idle = matches!(
+        s.screen,
+        Screen::Home(_) | Screen::Receive { .. } | Screen::Settings(_)
+    );
+    if present && session.board_allowed.is_none() && idle {
+        interrupt(&mut s, Screen::WifiPrompt);
+        drop(s);
+        shell.attention();
+        s = shell.state.lock();
+    }
     // Still probing: hello twice a second. Found: every five seconds, to follow its Wi-Fi.
     let every = if present { 5000 } else { 500 };
     if now.wrapping_sub(session.board_hello) >= every {
         session.board_hello = now;
         board.hello();
     }
-    let online = s.wifi == Some(wifi::Net::Online);
-    let stale = s.price.is_none() || now.wrapping_sub(session.board_market) >= MARKET_EVERY_MS;
-    // Fresh on the Network screen; otherwise once a minute (the price shows in reviews).
-    let wanted = stale || (s.screen == Screen::Network && now.wrapping_sub(session.board_market) >= TRACK_EVERY_MS * 3);
-    if online && wanted && now.wrapping_sub(session.board_market) >= 2000 {
-        session.board_market = now;
-        board.ask_price();
-        board.ask_network();
-    }
-    if let Some(t) = s.track.as_mut() {
-        if present && !settled(t) && now.wrapping_sub(t.asked) >= TRACK_EVERY_MS {
-            t.asked = now;
-            board.ask(&t.txid);
+    if allowed {
+        let online = s.wifi == Some(wifi::Net::Online);
+        let stale = s.price.is_none() || now.wrapping_sub(session.board_market) >= MARKET_EVERY_MS;
+        // Fresh on the Blockchain screen; otherwise once a minute (the price shows in reviews).
+        let wanted =
+            stale || (s.screen == Screen::Network && now.wrapping_sub(session.board_market) >= TRACK_EVERY_MS * 3);
+        if online && wanted && now.wrapping_sub(session.board_market) >= 2000 {
+            session.board_market = now;
+            board.ask_price();
+            board.ask_network();
+        }
+        if let Some(t) = s.track.as_mut() {
+            if !settled(t) && now.wrapping_sub(t.asked) >= TRACK_EVERY_MS {
+                t.asked = now;
+                board.ask(&t.txid);
+            }
         }
     }
     let gone = if present {
@@ -317,12 +330,20 @@ fn poll_board(shell: &Shell<State>, session: &mut Session) {
     };
     if gone {
         // No board (or it was unplugged): power the header off again.
-        if s.wifi.is_some() && matches!(s.screen, Screen::Track | Screen::Network) {
+        if matches!(s.screen, Screen::Track | Screen::Network) {
             s.screen = Screen::Home(0);
+        } else if s.screen == Screen::WifiPrompt {
+            s.screen = s.resume;
         }
         s.wifi = None;
         drop(s);
         session.board = None;
+        session.board_seen = false;
+        session.board_wifi_sent = false;
+        // A board plugged in again later asks again.
+        if session.board_allowed == Some(true) {
+            session.board_allowed = None;
+        }
     }
 }
 
@@ -336,21 +357,6 @@ fn next_index() -> u32 {
 fn save_index(index: u32) {
     if let Ok(mut f) = OpenOptions::new().write(true).create_always(true).open(vault::INDEX_PATH) {
         let _ = f.write(&index.to_le_bytes());
-    }
-}
-
-/// Loads zkSNARK `id` (1..=10,000) from the SD card.
-fn show_snark(s: &mut State, id: u16) {
-    s.snark = id;
-    s.last_step = unsafe { sys::furi_get_tick() };
-    s.snark_pixels = None;
-    let Ok(mut f) = OpenOptions::new().read(true).open_existing(true).open(SNARKS_PATH) else { return };
-    let offset = (id as u64 - 1) * SNARK_RECORD as u64;
-    if unsafe { sys::storage_file_seek(f.as_ptr(), offset as u32, true) } {
-        let mut buf = [0u8; SNARK_RECORD];
-        if f.read(&mut buf).ok() == Some(SNARK_RECORD) {
-            s.snark_pixels = Some(buf);
-        }
     }
 }
 
@@ -476,6 +482,13 @@ fn finish(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session,
             let step = session.core.address_changed(j, &text);
             apply(shell, worker, session, step);
         }
+        Job::ViewKey(text, qr) => {
+            let mut s = shell.state.lock();
+            s.ufvk = Some((text, qr));
+            if s.screen == Screen::Busy("Viewing key") {
+                s.screen = Screen::ViewKey { text: false, line: 0 };
+            }
+        }
         Job::Reviewed(result) => {
             let step = session.core.reviewed(result);
             apply(shell, worker, session, step);
@@ -533,39 +546,11 @@ fn input(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session, 
                     "Receive" if s.address.is_some() => s.screen = Screen::Receive { text: false },
                     "Receive" => s.screen = Screen::Busy("Forging address"),
                     // The last transaction first while it is still being followed.
-                    "Network" if s.track.as_ref().is_some_and(|t| !settled(t)) => s.screen = Screen::Track,
-                    "Network" => s.screen = Screen::Network,
-                    "Collections" => s.screen = Screen::Collections(0),
+                    "Blockchain" if s.track.as_ref().is_some_and(|t| !settled(t)) => s.screen = Screen::Track,
+                    "Blockchain" => s.screen = Screen::Network,
                     _ => s.screen = Screen::Settings(0),
                 },
                 Key::Back => return false,
-                _ => {}
-            }
-        }
-        Screen::Collections(_) => match k {
-            Key::Ok => {
-                let id = s.snark;
-                show_snark(&mut s, id);
-                s.playing = true;
-                s.screen = if s.snark_pixels.is_some() {
-                    Screen::Gallery
-                } else {
-                    Screen::Message("Copy snarks.bin to\napps_data/zflip")
-                };
-            }
-            Key::Back => s.screen = home_at(&s, "Collections"),
-            _ => {}
-        },
-        Screen::Gallery => {
-            let id = s.snark;
-            match k {
-                Key::Ok => s.playing = !s.playing,
-                Key::Right => show_snark(&mut s, if id >= SNARKS { 1 } else { id + 1 }),
-                Key::Left => show_snark(&mut s, if id <= 1 { SNARKS } else { id - 1 }),
-                Key::LongOk => show_snark(&mut s, if id > SNARKS - 100 { 1 } else { id + 100 }),
-                Key::Up => s.fast = true,
-                Key::Down => s.fast = false,
-                Key::Back => s.screen = Screen::Collections(0),
                 _ => {}
             }
         }
@@ -585,17 +570,28 @@ fn input(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session, 
                     launch::after_exit(launch::SETUP, c"reveal");
                     return false;
                 }
+                // Already derived at unlock (the phone gets it too): no PIN, no setup module.
                 Key::Ok if sel == 1 => {
-                    launch::after_exit(launch::SETUP, c"viewkey");
-                    return false;
+                    if let Some(account) = s.account.clone() {
+                        s.screen = Screen::Busy("Viewing key");
+                        worker.spawn(move || {
+                            let text = account.ufvk();
+                            let qr = Qr::address(&text);
+                            Job::ViewKey(text, qr)
+                        });
+                    }
                 }
                 Key::Ok if sel == 2 => {
                     launch::after_exit(launch::SETUP, c"pin");
                     return false;
                 }
                 Key::Ok if sel == 3 => {
-                    launch::after_exit(launch::SETUP, c"network");
-                    return false;
+                    drop(s);
+                    let note = ask_network(shell);
+                    // A newer network goes to the board at its next hello.
+                    session.board_wifi_sent = false;
+                    shell.state.lock().screen = Screen::Message(note);
+                    return true;
                 }
                 Key::Ok if sel == 4 => {
                     session.link = None;
@@ -654,7 +650,7 @@ fn input(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session, 
             }
         }
         Screen::Track => match k {
-            Key::Back => s.screen = home_at(&s, "Network"),
+            Key::Back => s.screen = home_at(&s, "Blockchain"),
             Key::Right => s.screen = Screen::Network,
             // Ask again now.
             Key::Ok => {
@@ -664,8 +660,34 @@ fn input(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session, 
             }
             _ => {}
         },
+        Screen::ViewKey { text, line } => match k {
+            Key::Ok => s.screen = Screen::ViewKey { text: !text, line: 0 },
+            Key::Down if text => s.screen = Screen::ViewKey { text, line: (line + 1).min(5) },
+            Key::Up if text => s.screen = Screen::ViewKey { text, line: line.saturating_sub(1) },
+            Key::Back => {
+                s.ufvk = None;
+                s.screen = Screen::Settings(1);
+            }
+            _ => {}
+        },
+        Screen::WifiPrompt => match k {
+            Key::Ok => {
+                session.board_allowed = Some(true);
+                s.screen = s.resume;
+                drop(s);
+                shell.success();
+            }
+            Key::Back => {
+                // Refused: power it off and leave it alone until ZFlip opens again.
+                session.board_allowed = Some(false);
+                session.board = None;
+                s.wifi = None;
+                s.screen = s.resume;
+            }
+            _ => {}
+        },
         Screen::Network => match k {
-            Key::Back => s.screen = home_at(&s, "Network"),
+            Key::Back => s.screen = home_at(&s, "Blockchain"),
             Key::Left if s.track.is_some() => s.screen = Screen::Track,
             _ => {}
         },
@@ -764,19 +786,19 @@ fn menu(g: &Gfx, items: &[&str], sel: u8, x: i32, y0: i32, step: i32) {
     }
 }
 
-/// The iPhone link, as a small badge in the title bar's right corner.
+/// The phone link, as a Bluetooth rune in the title bar's right corner: steady once
+/// paired, blinking while the phone connects, absent otherwise.
 fn link_badge(g: &Gfx, s: &State) {
-    g.white();
-    let x = 112;
-    if s.paired {
-        // A filled dot with a ring: paired and ready to sign.
-        g.disc(x + 6, 5, 3);
-        g.frame(x, 0, 13, 11);
-    } else if s.connected {
-        g.disc(x + 6, 5, 2);
-    } else if (s.frame / 15) % 2 == 0 {
-        g.dot(x + 6, 5);
+    if !s.paired && !(s.connected && (s.frame / 12) % 2 == 0) {
+        return;
     }
+    g.white();
+    let (x, y) = (121, 1);
+    g.line(x, y, x, y + 8);
+    g.line(x, y, x + 2, y + 2);
+    g.line(x + 2, y + 2, x - 2, y + 6);
+    g.line(x, y + 8, x + 2, y + 6);
+    g.line(x + 2, y + 6, x - 2, y + 2);
     g.black();
 }
 
@@ -785,13 +807,12 @@ fn draw(g: &Gfx, s: &State) {
         Screen::Pin => s.pin.draw(g, "ZFlip: PIN", s.note),
         Screen::Busy(label) => ui::draw_busy(g, label, s.frame),
         Screen::Home(sel) => {
-            g.title(if s.meta.map(|m| m.network) == Some(Network::Test) { "ZFlip testnet" } else { "ZFlip" });
+            g.title("ZFlip");
             link_badge(g, s);
             g.shield(18, 37, 1000, 0);
             let items = home_items(s);
             let sel = sel.min(items.len() as u8 - 1);
-            // Four entries (with the Wi-Fi board) sit closer together.
-            if items.len() > 3 { menu(g, items, sel, 40, 21, 10) } else { menu(g, items, sel, 40, 23, 12) }
+            menu(g, items, sel, 40, 23, 12);
             g.font(Font::Small);
             wifi_badge(g, s);
             g.text(
@@ -828,40 +849,9 @@ fn draw(g: &Gfx, s: &State) {
                 g.text(68, 58, "OK: text");
             }
         }
-        Screen::Gallery => {
-            if let Some(px) = &s.snark_pixels {
-                for y in 0..26 {
-                    for x in 0..26 {
-                        let k = y * 26 + x;
-                        let level = (px[k / 4] >> (2 * (k % 4))) & 3;
-                        for dy in 0..2 {
-                            for dx in 0..2 {
-                                if level == 2 || (level == 1 && (dx + dy) % 2 == 0) {
-                                    g.dot(4 + x as i32 * 2 + dx, 8 + y as i32 * 2 + dy);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            g.font(Font::Big);
-            g.text(62, 14, "zkSNARKs");
-            g.font(Font::Numbers);
-            g.text(62, 38, &gfx::num(s.snark as u64));
-            g.font(Font::Small);
-            g.text(62, 50, if s.playing { if s.fast { ">> fast" } else { "> playing" } } else { "|| paused" });
-            g.text(62, 61, "of 10000");
-        }
-        Screen::Collections(sel) => {
-            g.title("Collections");
-            menu(g, &COLLECTIONS, sel, 4, 24, 12);
-            g.font(Font::Small);
-            g.text(4, 61, "10,000 zkSNARKs NFTs");
-        }
         Screen::Settings(sel) => {
             g.title("Settings");
-            let net = if s.meta.map(|m| m.network) == Some(Network::Test) { "Network: testnet" } else { "Network: mainnet" };
-            let items = [SETTINGS[0], SETTINGS[1], SETTINGS[2], net, SETTINGS[4], SETTINGS[5]];
+            let items = SETTINGS;
             // Scrolls: the selected row stays in the five that fit.
             let first = sel.saturating_sub(SETTINGS_ROWS - 1);
             let end = (first + SETTINGS_ROWS) as usize;
@@ -874,6 +864,32 @@ fn draw(g: &Gfx, s: &State) {
             g.center(38, "this Flipper. Only your");
             g.center(48, "written words restore it.");
             g.hints("Back", "Hold OK: wipe");
+        }
+        Screen::ViewKey { text, line } => {
+            let Some((key, qr)) = &s.ufvk else { return };
+            if text {
+                g.title("Viewing key");
+                g.wrapped(1, 19, key, 21, line as usize, 5);
+            } else {
+                if let Some(qr) = qr {
+                    g.qr(qr, 0);
+                }
+                g.font(Font::Big);
+                g.text(68, 12, "Viewing");
+                g.text(68, 24, "key");
+                g.font(Font::Small);
+                g.text(68, 36, "Sees, never");
+                g.text(68, 45, "spends");
+                g.text(68, 60, "OK: text");
+            }
+        }
+        Screen::WifiPrompt => {
+            g.title("Wi-Fi board");
+            g.font(Font::Small);
+            g.center(26, "Let it go online for");
+            g.center(36, "prices and transactions?");
+            g.center(46, "(it never gets your keys)");
+            g.hints("Back: no", "OK: yes");
         }
         Screen::PairPrompt => {
             g.title("Phone wants in");
@@ -917,7 +933,9 @@ fn draw(g: &Gfx, s: &State) {
                 g.right(126, 47, &zec(r.total_out()));
                 // In dollars, from the Wi-Fi board's price: a guide, never part of what is signed.
                 if let Some(p) = s.price {
-                    g.right(126, 56, &["~ ", &usd(r.total_out() as u128 * p.usd_cents as u128 / zfirm_core::COIN as u128)].concat());
+                    // To the nearest 1000 zatoshis, in u64 (u128 maths costs ~1.5 KiB of code).
+                    let cents = (r.total_out() / 1000).saturating_mul(p.usd_cents) / (zfirm_core::COIN / 1000);
+                    g.right(126, 56, &["~ ", &usd(cents)].concat());
                 }
                 g.hints("Back: refuse", "Hold OK: sign");
             }
@@ -940,9 +958,9 @@ fn draw(g: &Gfx, s: &State) {
 }
 
 /// "$1270.99" from cents.
-fn usd(cents: u128) -> String {
-    let c = num((cents % 100) as u64);
-    [ "$", &num((cents / 100) as u64), ".", if c.len() < 2 { "0" } else { "" }, &c ].concat()
+fn usd(cents: u64) -> String {
+    let c = num(cents % 100);
+    ["$", &num(cents / 100), ".", if c.len() < 2 { "0" } else { "" }, &c].concat()
 }
 
 /// "+3.77%" from basis points.
@@ -966,13 +984,34 @@ fn draw_network(g: &Gfx, s: &State) {
     g.right(126, 22, &num(n.height as u64));
     if let Some(p) = s.price {
         g.text(2, 32, "ZEC");
-        g.right(126, 32, &[usd(p.usd_cents as u128).as_str(), "  ", &percent(p.change)].concat());
+        g.right(126, 32, &[usd(p.usd_cents).as_str(), "  ", &percent(p.change)].concat());
     }
     g.text(2, 42, "Transactions 24 h");
     g.right(126, 42, &num(n.txs_24h as u64));
     g.text(2, 52, "Shielded");
     g.right(126, 52, &[num(n.shielded as u64 / 10).as_str(), ".", &num(n.shielded as u64 % 10), "%"].concat());
     g.hints("Back", if s.track.is_some() { "< Transaction" } else { "" });
+}
+
+/// The Wi-Fi network for the Wi-Fi board: its name, then its password, with the
+/// Flipper's keyboard. Returns what to tell the user.
+fn ask_network(shell: &Shell<State>) -> &'static str {
+    let saved = wifi::saved_network();
+    let current = saved.as_ref().map_or("", |(ssid, _)| ssid.as_str());
+    let Some(ssid) = shell.ask_text(c"Wi-Fi network name", current, 32, 1) else { return "Wi-Fi unchanged" };
+    // Never shown again once saved. Empty keeps it for the same network; for a new
+    // one, empty means an open network.
+    let same = saved.as_ref().is_some_and(|(s, _)| *s == ssid);
+    let header = if same { c"Password (empty: keep)" } else { c"Password (empty: open)" };
+    let Some(mut pass) = shell.ask_text(header, "", 64, 0) else { return "Wi-Fi unchanged" };
+    if pass.is_empty() && same {
+        pass = saved.map(|(_, p)| p).unwrap_or_default();
+    }
+    // WPA needs 8 characters or more.
+    if !pass.is_empty() && pass.len() < 8 {
+        return "Password too short:\nWi-Fi unchanged";
+    }
+    if wifi::save_network(&ssid, &pass) { "Saved: the Wi-Fi\nboard joins it" } else { "Could not save\nthe Wi-Fi network" }
 }
 
 fn home_items(s: &State) -> &'static [&'static str] {
@@ -988,17 +1027,24 @@ fn settled(t: &Track) -> bool {
     matches!(t.tx, wifi::Tx::Mined { confirmations, .. } if confirmations >= SETTLED)
 }
 
-/// The Wi-Fi board, as bars left of the phone badge: filled when online.
+/// The Wi-Fi board, as the Wi-Fi fan left of the Bluetooth rune: whole once online,
+/// its inner arc blinking while it joins, the dot alone without a network.
 fn wifi_badge(g: &Gfx, s: &State) {
     let Some(net) = s.wifi else { return };
     g.white();
-    for i in 0..3 {
-        let (x, h) = (100 + i * 3, 3 + i * 2);
-        if net == wifi::Net::Online {
-            g.fill(x, 9 - h, 2, h);
-        } else {
-            g.dot(x, 8);
-        }
+    let (cx, y) = (108, 9);
+    g.dot(cx, y);
+    let arcs = match net {
+        wifi::Net::Online => 3,
+        wifi::Net::Connecting if (s.frame / 12) % 2 == 0 => 1,
+        _ => 0,
+    };
+    // Each arc as three strokes, wider and higher outwards.
+    for r in 1..=arcs {
+        let (w, h) = (2 * r, 2 * r);
+        g.line(cx - w, y - h / 2, cx - w / 2, y - h);
+        g.line(cx - w / 2, y - h, cx + w / 2, y - h);
+        g.line(cx + w / 2, y - h, cx + w, y - h / 2);
     }
     g.black();
 }

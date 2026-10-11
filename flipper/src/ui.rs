@@ -58,6 +58,17 @@ fn key(e: &sys::InputEvent) -> Option<Key> {
     })
 }
 
+/// How the keyboard of [`Shell::ask_text`] closed: 0 still open, 1 entered, 2 backed out.
+static TEXT_DONE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+unsafe extern "C" fn text_entered(_: *mut c_void) {
+    TEXT_DONE.store(1, Ordering::Release);
+}
+
+unsafe extern "C" fn text_back(_: *mut c_void) {
+    TEXT_DONE.store(2, Ordering::Release);
+}
+
 /// A full-screen view port drawing `S` through `draw`.
 pub struct Shell<S: 'static> {
     pub state: &'static Mutex<S>,
@@ -67,6 +78,8 @@ pub struct Shell<S: 'static> {
     vp: *mut sys::ViewPort,
     gui: *mut sys::Gui,
     notify: *mut sys::NotificationApp,
+    /// The draw callback's context, freed with the shell.
+    ctx: *mut DrawCtx<S>,
 }
 
 pub struct DrawCtx<S: 'static> {
@@ -87,20 +100,21 @@ unsafe extern "C" fn input_cb(event: *mut sys::InputEvent, ctx: *mut c_void) {
 }
 
 impl<S> Shell<S> {
-    /// The state and queue live for the whole app run (leaked on purpose: the app
-    /// exits right after the shell is dropped).
+    /// The state and queue live for the whole app run, and go with the shell. Even a
+    /// few bytes left behind matter: they would split the heap the next app (or this
+    /// one, coming back from its setup module) needs in one piece.
     pub fn new(state: S, draw: fn(&Gfx, &S)) -> Self {
         let state: &'static Mutex<S> = alloc::boxed::Box::leak(alloc::boxed::Box::new(Mutex::new(state)));
         let queue = unsafe { sys::furi_message_queue_alloc(8, core::mem::size_of::<sys::InputEvent>() as u32) };
-        let ctx: &'static DrawCtx<S> = alloc::boxed::Box::leak(alloc::boxed::Box::new(DrawCtx { state, draw }));
+        let ctx: *mut DrawCtx<S> = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(DrawCtx { state, draw }));
         unsafe {
             let vp = sys::view_port_alloc();
-            sys::view_port_draw_callback_set(vp, Some(draw_cb::<S>), ctx as *const _ as *mut c_void);
+            sys::view_port_draw_callback_set(vp, Some(draw_cb::<S>), ctx as *mut c_void);
             sys::view_port_input_callback_set(vp, Some(input_cb), queue as *mut c_void);
             let gui = sys::furi_record_open(c"gui".as_ptr()) as *mut sys::Gui;
             sys::gui_add_view_port(gui, vp, sys::GuiLayerFullscreen);
             let notify = sys::furi_record_open(c"notification".as_ptr()) as *mut sys::NotificationApp;
-            Shell { state, queue, vp, gui, notify }
+            Shell { state, queue, vp, gui, notify, ctx }
         }
     }
 
@@ -114,6 +128,54 @@ impl<S> Shell<S> {
         }
         let event = unsafe { event.assume_init() };
         key(&event)
+    }
+
+    /// Replaces the state with `empty`, dropping everything the old one held (keys,
+    /// addresses, words). Call before exiting: the state itself outlives the app, and
+    /// what it still held would stay in RAM, secrets included, splitting the heap the
+    /// next app needs whole.
+    pub fn clear(&self, empty: S) {
+        *self.state.lock() = empty;
+    }
+
+    /// Asks for a line of text with the Flipper's own keyboard, over this shell
+    /// (which is hidden meanwhile): `None` if the user backs out.
+    #[allow(dead_code)]
+    pub fn ask_text(&self, header: &core::ffi::CStr, initial: &str, max: usize, min: usize) -> Option<alloc::string::String> {
+        let mut buf = alloc::vec![0u8; max + 1];
+        let n = initial.len().min(max);
+        buf[..n].copy_from_slice(&initial.as_bytes()[..n]);
+        TEXT_DONE.store(0, Ordering::Release);
+        unsafe {
+            sys::view_port_enabled_set(self.vp, false);
+            let input = sys::text_input_alloc();
+            let holder = sys::view_holder_alloc();
+            sys::view_holder_set_view(holder, sys::text_input_get_view(input));
+            sys::view_holder_attach_to_gui(holder, self.gui);
+            sys::view_holder_set_back_callback(holder, Some(text_back), core::ptr::null_mut());
+            sys::text_input_set_header_text(input, header.as_ptr());
+            sys::text_input_set_minimum_length(input, min);
+            sys::text_input_set_result_callback(
+                input,
+                Some(text_entered),
+                core::ptr::null_mut(),
+                buf.as_mut_ptr() as *mut core::ffi::c_char,
+                buf.len(),
+                false,
+            );
+            while TEXT_DONE.load(Ordering::Acquire) == 0 {
+                sys::furi_delay_ms(50);
+            }
+            sys::view_holder_set_view(holder, core::ptr::null_mut());
+            sys::view_holder_free(holder);
+            sys::text_input_free(input);
+            sys::view_port_enabled_set(self.vp, true);
+        }
+        if TEXT_DONE.load(Ordering::Acquire) != 1 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        core::str::from_utf8(&buf[..end]).ok().map(alloc::string::String::from)
     }
 
     pub fn buzz(&self, seq: &'static sys::NotificationSequence) {
@@ -141,6 +203,9 @@ impl<S> Drop for Shell<S> {
             sys::furi_message_queue_free(self.queue);
             sys::furi_record_close(c"gui".as_ptr());
             sys::furi_record_close(c"notification".as_ptr());
+            // Nothing draws any more: the context and the state can go.
+            drop(alloc::boxed::Box::from_raw(self.ctx));
+            drop(alloc::boxed::Box::from_raw(self.state as *const Mutex<S> as *mut Mutex<S>));
         }
     }
 }

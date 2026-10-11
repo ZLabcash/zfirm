@@ -4,7 +4,6 @@
 //! Drawing helpers: text, wrapped addresses, QR codes and the shield animation.
 
 use flipperzero_sys as sys;
-use qrcodegen_no_heap::{QrCode, QrCodeEcc, Version};
 
 pub use sys::Canvas;
 
@@ -120,7 +119,7 @@ impl Gfx {
         }
     }
 
-    /// Draws a QR code computed with [`Qr::encode`], centred in the left square.
+    /// Draws a QR code computed with [`Qr::address`], centred in the left square.
     pub fn qr(&self, qr: &Qr, left: i32) {
         let size = qr.size;
         let scale = (H / (size + 2)).max(1);
@@ -229,19 +228,10 @@ impl Qr {
         Qr { size, bits }
     }
 
-    /// Addresses: the compact encoder (versions 1 to 6), cheap in code size.
+    /// Addresses and viewing keys: the compact encoder (versions 1 to 9), cheap in code size.
     pub fn address(text: &str) -> Option<Qr> {
         let qr = zfirm_core::qr::Qr::encode(text.as_bytes())?;
         Some(Qr::from_modules(qr.size as i32, |x, y| qr.get(x as usize, y as usize)))
-    }
-
-    /// Longer texts (the viewing key): byte mode, low ECC, up to version 10.
-    pub fn encode(text: &str) -> Option<Qr> {
-        let mut temp = [0u8; Version::new(10).buffer_len()];
-        let mut out = [0u8; Version::new(10).buffer_len()];
-        let qr = QrCode::encode_text(text, &mut temp, &mut out, QrCodeEcc::Low, Version::MIN, Version::new(10), None, true)
-            .ok()?;
-        Some(Qr::from_modules(qr.size(), |x, y| qr.get_module(x, y)))
     }
 
     fn get(&self, x: i32, y: i32) -> bool {

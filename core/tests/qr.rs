@@ -10,12 +10,15 @@ fn reference(data: &[u8], version: u8) -> QrCode {
 
 #[test]
 fn matches_qrcodegen() {
-    let mut inputs: Vec<Vec<u8>> = vec![b"zcash".to_vec(), vec![0x42; 60], vec![7; 100]];
+    let mut inputs: Vec<Vec<u8>> =
+        vec![b"zcash".to_vec(), vec![0x42; 60], vec![7; 100], vec![9; 150], vec![3; 190], vec![1; 230]];
     for (net, seed) in [(Network::Main, 1u8), (Network::Test, 2)] {
         let a = Account::from_seed(&[seed; 32], net, 0).unwrap();
         for j in [0u32, 1, 77, 123456] {
             inputs.push(a.encode_address(j).into_bytes());
         }
+        // Viewing keys (195 characters): version 9.
+        inputs.push(a.ufvk().into_bytes());
     }
     for data in inputs {
         let ours = Qr::encode(&data).expect("fits");
@@ -28,5 +31,5 @@ fn matches_qrcodegen() {
             }
         }
     }
-    assert!(Qr::encode(&[0; 200]).is_none());
+    assert!(Qr::encode(&[0; 231]).is_none());
 }

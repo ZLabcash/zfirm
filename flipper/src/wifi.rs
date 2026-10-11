@@ -1,3 +1,6 @@
+// Shared by both apps: the setup module only uses the saved network.
+#![allow(dead_code)]
+
 //! The Wi-Fi devboard on the GPIO header, running the ZFirm Wi-Fi board firmware (wifi-board/):
 //! it tells where a signed transaction stands (mempool, block, confirmations).
 //! It only ever learns transaction ids and the Wi-Fi network to join: no keys.
@@ -14,6 +17,8 @@ use flipperzero_sys as sys;
 const BAUD: u32 = 115_200;
 /// Wi-Fi network for the board: the SSID on the first line, the password on the second.
 const WIFI_FILE: &core::ffi::CStr = c"/ext/apps_data/zflip/wifi.txt";
+/// Present while the saved network has not reached the board yet.
+const WIFI_NEW: &core::ffi::CStr = c"/ext/apps_data/zflip/wifi.new";
 
 static mut RX: Option<stream_buffer::Sender> = None;
 
@@ -147,13 +152,7 @@ impl Board {
 
     /// Hands the board the Wi-Fi network saved on the SD card, if there is one.
     pub fn send_wifi(&self) -> bool {
-        let Some(text) = read_wifi_file() else { return false };
-        let mut lines = text.lines();
-        let ssid = lines.next().unwrap_or("").trim_end();
-        let pass = lines.next().unwrap_or("").trim_end();
-        if ssid.is_empty() {
-            return false;
-        }
+        let Some((ssid, pass)) = saved_network() else { return false };
         self.send(&[b"WIFI ", ssid.as_bytes(), b"\t", pass.as_bytes()]);
         true
     }
@@ -232,6 +231,38 @@ fn parse(line: &[u8]) -> Option<Reply> {
             shielded: words.next()?.parse().ok()?,
         })),
         _ => None,
+    }
+}
+
+/// The saved network: its name and password.
+pub fn saved_network() -> Option<(String, String)> {
+    let text = read_wifi_file()?;
+    let mut lines = text.lines();
+    let ssid = String::from(lines.next()?.trim_end());
+    let pass = String::from(lines.next().unwrap_or("").trim_end());
+    (!ssid.is_empty()).then_some((ssid, pass))
+}
+
+/// Saves the network for the board, to hand over next time ZFlip sees it.
+pub fn save_network(ssid: &str, pass: &str) -> bool {
+    use flipperzero::{io::Write, storage::OpenOptions};
+    let Ok(mut f) = OpenOptions::new().write(true).create_always(true).open(WIFI_FILE) else { return false };
+    let ok = [ssid.as_bytes(), b"\n", pass.as_bytes(), b"\n"].iter().all(|p| f.write(p).is_ok());
+    drop(f);
+    ok && OpenOptions::new().write(true).create_always(true).open(WIFI_NEW).is_ok()
+}
+
+/// Whether the saved network is newer than what the board was last given.
+pub fn network_pending() -> bool {
+    use flipperzero::storage::OpenOptions;
+    OpenOptions::new().read(true).open_existing(true).open(WIFI_NEW).is_ok()
+}
+
+pub fn network_delivered() {
+    unsafe {
+        let storage = sys::furi_record_open(c"storage".as_ptr()) as *mut sys::Storage;
+        sys::storage_simply_remove(storage, WIFI_NEW.as_ptr());
+        sys::furi_record_close(c"storage".as_ptr());
     }
 }
 

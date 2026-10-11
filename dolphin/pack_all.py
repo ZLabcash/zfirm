@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Packs all 10,000 zkSNARKs into dist/snarks.bin for the ZFlip gallery.
+"""Packs all 10,000 zkSNARKs into dist/snarks.bin for the zkSNARKs app (apps_data/zksnarks/).
 
 Record i-1 (169 bytes) = zkSNARK #i as 26x26 levels, 2 bits each, row-major,
 4 per byte from the low bits: 0 = off, 1 = dithered, 2 = ink (see snark1bit.py).

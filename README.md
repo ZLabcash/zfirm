@@ -65,11 +65,13 @@ is no radio at all; on a Kindle the link is Wi-Fi, so keep it on a network you t
   `cargo test --release --features english`.
 - `linux/` (`zfirm-linux`): the `zfirm` app for Linux devices. See [linux/README.md](linux/README.md).
 - `bridge/`: PCZT ↔ sign request glue for the iPhone app (Rust, C FFI).
-- `flipper/`: the Flipper app, ZFlip (`zflip.fap`, and `zflip_setup.fap`, a module it launches
-  for creating, restoring and revealing). `./build.sh` → `dist/` (Rust nightly: the standard
+- `flipper/`: the Flipper app, ZFlip (`zflip.fap`, mainnet, and `zflip_setup.fap`, a module it
+  launches for creating, restoring, revealing the words and changing the PIN; the Flipper restarts
+  after it, so ZFlip always gets a whole heap back), and `zksnarks.fap`, the viewer of the 10,000
+  zkSNARKs NFTs (Apps → Media, `snarks.bin` in `apps_data/zksnarks/`). `./build.sh` → `dist/` (Rust nightly: the standard
   library is rebuilt without panic messages to fit the Flipper's RAM).
 - `wifi-board/`: firmware for the Flipper Wi-Fi devboard (ESP32-S2, Rust on ESP-IDF).
-- `dolphin/`: zkSNARKs desktop animations and the NFT gallery pack.
+- `dolphin/`: zkSNARKs desktop animations and `snarks.bin`, the pack for `zksnarks.fap`.
 - `vendor/`: `pasta_curves`, `sinsemilla` and a compact `blake2b_simd`, trimmed for a Flipper
   app's ~100 KiB of RAM.
 

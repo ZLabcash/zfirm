@@ -1,12 +1,25 @@
-//! A minimal QR encoder for receiving addresses: byte mode, error correction level
-//! L, versions 1 to 6, mask 0. Small on purpose (a general QR library costs ~7 KiB
+//! A minimal QR encoder for receiving addresses and viewing keys: byte mode, error
+//! correction level L, versions 1 to 9 (up to 230 bytes, 53 modules: one pixel each
+//! still fits the Flipper's 64-pixel screen), mask 0. Small on purpose (a general QR library costs ~7 KiB
 //! of a Flipper app's RAM). Matches `qrcodegen` with the same version and mask
 //! (see tests/qr.rs).
 
 use alloc::vec::Vec;
 
-/// (data codewords per block, EC codewords per block, blocks) for level L, v1..=6.
-const BLOCKS: [(usize, usize, usize); 6] = [(19, 7, 1), (34, 10, 1), (55, 15, 1), (80, 20, 1), (108, 26, 1), (68, 18, 2)];
+/// (data codewords per block, EC codewords per block, blocks) for level L, v1..=9.
+const BLOCKS: [(usize, usize, usize); 9] = [
+    (19, 7, 1),
+    (34, 10, 1),
+    (55, 15, 1),
+    (80, 20, 1),
+    (108, 26, 1),
+    (68, 18, 2),
+    (78, 20, 2),
+    (97, 24, 2),
+    (116, 30, 2),
+];
+/// The middle alignment pattern row/column of versions 7..=9 (the others are 6 and size - 7).
+const ALIGN_MID: [usize; 3] = [22, 24, 26];
 /// Format information for level L with mask 0, bits 14..0.
 const FORMAT_L_MASK0: u16 = 0b111011111000100;
 
@@ -40,9 +53,9 @@ impl Qr {
         self.modules.get(y * self.size + x)
     }
 
-    /// Encodes `data`; `None` if it needs more than version 6 (134 bytes).
+    /// Encodes `data`; `None` if it needs more than version 9 (230 bytes).
     pub fn encode(data: &[u8]) -> Option<Qr> {
-        let version = (1..=6).find(|&v| {
+        let version = (1..=9).find(|&v| {
             let (d, _, b) = BLOCKS[v - 1];
             4 + 8 + data.len() * 8 <= d * b * 8
         })?;
@@ -117,14 +130,39 @@ impl Qr {
                 }
             }
         }
-        // Alignment pattern (versions 2..=6 have one, bottom right).
-        if version >= 2 {
-            let c = size - 7;
-            for dy in -2i32..=2 {
-                for dx in -2i32..=2 {
-                    let d = dx.abs().max(dy.abs());
-                    self.set(function, (c as i32 + dx) as usize, (c as i32 + dy) as usize, d != 1);
+        // Alignment patterns: one bottom right for versions 2..=6; a 3×3 grid (less the
+        // three corners the finders take) for 7..=9.
+        let centers: &[usize] = match version {
+            1 => &[],
+            2..=6 => &[size - 7],
+            _ => &[6, ALIGN_MID[version - 7], size - 7],
+        };
+        let last = size - 7;
+        for &cy in centers {
+            for &cx in centers {
+                if (cx == 6 && cy == 6) || (cx == 6 && cy == last) || (cx == last && cy == 6) {
+                    continue;
                 }
+                for dy in -2i32..=2 {
+                    for dx in -2i32..=2 {
+                        let d = dx.abs().max(dy.abs());
+                        self.set(function, (cx as i32 + dx) as usize, (cy as i32 + dy) as usize, d != 1);
+                    }
+                }
+            }
+        }
+        // Version information (7 and up): 6 bits and a BCH(18, 6) remainder, twice.
+        if version >= 7 {
+            let mut rem = version as u32;
+            for _ in 0..12 {
+                rem = (rem << 1) ^ ((rem >> 11) * 0x1F25);
+            }
+            let info = (version as u32) << 12 | rem;
+            for i in 0..18 {
+                let dark = (info >> i) & 1 == 1;
+                let (a, b) = (size - 11 + i % 3, i / 3);
+                self.set(function, a, b, dark);
+                self.set(function, b, a, dark);
             }
         }
         // Format information (both copies) and the dark module.

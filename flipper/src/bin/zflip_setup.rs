@@ -1,6 +1,7 @@
-//! ZFlip's setup module: create or restore the wallet, show its recovery words,
-//! switch network. Kept out of the Apps menu (see `launch.rs`): ZFlip starts it with
-//! an argument ("create", "reveal" or "network") and it starts ZFlip again when done.
+//! ZFlip's setup module: create or restore the wallet (mainnet), show its recovery
+//! words, change the PIN. Kept out of the Apps menu (see `launch.rs`): ZFlip starts it with
+//! an argument ("create", "reveal", "viewkey" or "pin") and it starts ZFlip
+//! again when done.
 
 #![no_main]
 #![no_std]
@@ -45,7 +46,6 @@ enum PinFor {
     New,
     Confirm,
     Reveal,
-    Network,
     ViewKey,
     /// The current PIN, before choosing a new one.
     Current,
@@ -127,12 +127,24 @@ enum Job {
     Opened(Result<(vault::Meta, vault::Secret), vault::Error>),
 }
 
+/// What ZFlip needs over this module to load again: whatever the system allocates while
+/// this module runs lands just past it, and would split the block ZFlip comes back to.
+/// A spacer this size, taken first and freed last, keeps those allocations beyond it.
+const SPACER: u32 = 24 * 1024;
+
 fn main(args: Option<&CStr>) -> i32 {
+    // `black_box`: an allocation nothing reads is otherwise optimised away.
+    let spacer = core::hint::black_box(unsafe { flipperzero_sys::malloc(SPACER) });
+    let code = run(args);
+    unsafe { flipperzero_sys::free(core::hint::black_box(spacer)) };
+    code
+}
+
+fn run(args: Option<&CStr>) -> i32 {
     let arg = args.and_then(|a| a.to_str().ok()).unwrap_or("create");
     let exists = vault::exists();
     let start = match arg {
         "reveal" if exists => Screen::Pin(PinFor::Reveal),
-        "network" if exists => Screen::Pin(PinFor::Network),
         "viewkey" if exists => Screen::Pin(PinFor::ViewKey),
         "pin" if exists => Screen::Pin(PinFor::Current),
         _ if exists => {
@@ -147,28 +159,7 @@ fn main(args: Option<&CStr>) -> i32 {
         _ => PinFor::New,
     };
     let mut worker = Worker::new(10 * 1024);
-    let shell = Shell::new(
-        State {
-            screen: start,
-            frame: 0,
-            indices: Vec::new(),
-            page_words: Vec::new(),
-            matches: 0,
-            shown: Vec::new(),
-            restored: false,
-            restore_count: 24,
-            entry: WordEntry::new(),
-            pin,
-            pad: PinPad::new(),
-            new_pin: Vec::new(),
-            note: "",
-            revealing: false,
-            done: false,
-            ufvk: None,
-            changing: None,
-        },
-        draw,
-    );
+    let shell = Shell::new(new_state(start, pin), draw);
     loop {
         let key = shell.next_key();
         if let Some(job) = worker.poll() {
@@ -187,11 +178,46 @@ fn main(args: Option<&CStr>) -> i32 {
         }
     }
     worker.wait();
-    // Back to ZFlip, unless there is still no wallet (the user gave up on setup).
-    if vault::exists() {
+    // Words, keys and PINs go with the old state (see `Shell::clear`).
+    shell.clear(new_state(Screen::Welcome(0), PinFor::New));
+    if exists {
+        // Opened from ZFlip: restart the Flipper rather than ZFlip. Each trip through
+        // this module leaves system allocations behind in the block ZFlip loads into,
+        // and a second trip back can no longer fit it; a restart gives it a whole heap.
+        shell.state.lock().screen = Screen::Busy("Restarting");
+        let _ = shell.next_key(); // draws it
+        unsafe {
+            flipperzero_sys::furi_delay_ms(600);
+            let power = flipperzero_sys::furi_record_open(c"power".as_ptr()) as *mut flipperzero_sys::Power;
+            flipperzero_sys::power_reboot(power, flipperzero_sys::PowerBootModeNormal);
+        }
+    } else if vault::exists() {
+        // A new wallet: on to ZFlip (unless the user gave up on setup).
         launch::after_exit(launch::MAIN, c"");
     }
     0
+}
+
+fn new_state(screen: Screen, pin: PinFor) -> State {
+    State {
+        screen,
+        frame: 0,
+        indices: Vec::new(),
+        page_words: Vec::new(),
+        matches: 0,
+        shown: Vec::new(),
+        restored: false,
+        restore_count: 24,
+        entry: WordEntry::new(),
+        pin,
+        pad: PinPad::new(),
+        new_pin: Vec::new(),
+        note: "",
+        revealing: false,
+        done: false,
+        ufvk: None,
+        changing: None,
+    }
 }
 
 fn finish(shell: &Shell<State>, job: Job) {
@@ -283,7 +309,7 @@ fn input(shell: &Shell<State>, worker: &mut Worker<Job>, k: Key) -> bool {
         Screen::Pin(purpose) => match s.pad.key(k) {
             Pin::Editing => {}
             Pin::Cancel => match purpose {
-                PinFor::Reveal | PinFor::Network | PinFor::ViewKey | PinFor::Current => return false,
+                PinFor::Reveal | PinFor::ViewKey | PinFor::Current => return false,
                 PinFor::New | PinFor::Confirm if s.changing.is_some() => return false,
                 PinFor::New | PinFor::Confirm => s.screen = Screen::Welcome(0),
             },
@@ -412,19 +438,10 @@ fn pin_entered(s: &mut State, worker: &mut Worker<Job>, purpose: PinFor, pin: Ve
                         })
                         .ok_or(vault::Error::Corrupt)?;
                         let text = key.ufvk();
-                        let qr = gfx::Qr::encode(&text);
+                        let qr = gfx::Qr::address(&text);
                         Ok((text, qr))
                     },
                 ))
-            });
-        }
-        PinFor::Network => {
-            s.screen = Screen::Busy("Switching network");
-            worker.spawn(move || {
-                Job::Created(vault::unseal(&pin, &mut half).and_then(|(meta, secret)| {
-                    let next = if meta.network == Network::Main { Network::Test } else { Network::Main };
-                    create(secret.entropy(), next, meta.created_at, &pin)
-                }))
             });
         }
     }
@@ -449,10 +466,6 @@ fn create(entropy: &[u8], network: Network, created_at: u32, pin: &[u8]) -> Resu
     vault::seal(&secret, network, created_at, &change, pin, &mut |p| PROGRESS.store(p, Ordering::Relaxed))
 }
 
-/// The vault KDF reports the first half of the progress bar.
-fn half(p: u32) {
-    PROGRESS.store(p / 2, Ordering::Relaxed);
-}
 
 fn menu(g: &Gfx, items: &[&str], sel: u8, x: i32, y0: i32, step: i32) {
     g.font(Font::Small);
@@ -522,7 +535,6 @@ fn draw(g: &Gfx, s: &State) {
                 PinFor::New => "New PIN (6-10)",
                 PinFor::Confirm => "Confirm PIN",
                 PinFor::Reveal => "PIN to show words",
-                PinFor::Network => "PIN to switch net",
                 PinFor::ViewKey => "PIN: viewing key",
                 PinFor::Current => "Current PIN",
             },
