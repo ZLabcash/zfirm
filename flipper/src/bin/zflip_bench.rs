@@ -20,7 +20,7 @@ use pasta_curves::{
     group::{Group, ff::Field},
     pallas,
 };
-use zflip_core::{Account, Network};
+use zfirm_core::{Account, Network};
 
 manifest!(name = "ZFlip Bench", app_version = 1, has_icon = false, stack_size = 16384);
 entry!(main);
@@ -107,7 +107,7 @@ fn main(_args: Option<&CStr>) -> i32 {
         let t = now();
         let internal = stable::with(|| account.address_in(orchard_scope_internal(), 3));
         log(c"internal address", t, 1);
-        log_text(&zflip_core::account::encode_orchard_address(Network::Main, &internal));
+        log_text(&zfirm_core::account::encode_orchard_address(Network::Main, &internal));
     }
     let free = unsafe { sys::furi_thread_get_stack_space(sys::furi_thread_get_current_id()) };
     log(c"stack never used (bytes, of 16384)", now(), free as u32);

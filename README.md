@@ -1,30 +1,42 @@
-# ZFlip
+# ZFirm
 
 > [!WARNING]
-> **Experimental software. Not audited.** ZFlip is a research prototype. It has not been
+> **Experimental software. Not audited.** ZFirm is a research prototype. It has not been
 > reviewed by any third party, parts of its cryptography were rewritten to fit the Flipper's
-> RAM, and the Flipper Zero has no secure element like a Ledger. Use it only with small
-> amounts you can afford to lose, keep your 24 words on paper, and never use a seed whose
-> words have been seen by anyone else. No warranty of any kind (see the licenses).
+> RAM, and none of the devices it runs on has a secure element like a Ledger. Use it only
+> with small amounts you can afford to lose, keep your words on paper, and never use a seed
+> whose words have been seen by anyone else. No warranty of any kind (see the licenses).
 
-A Zcash shielded wallet for the Flipper Zero. The Flipper holds the seed and signs; the
-iPhone app ([ZApp](https://github.com/ZLabcash/zapp)) holds only the viewing key: it syncs,
-builds transactions and their proofs, and broadcasts. They talk over Bluetooth.
+One Zcash shielded signer for any small device you own. The device holds the seed and
+signs; the phone app ([ZApp](https://github.com/ZLabcash/zapp)) holds only the viewing key:
+it syncs, builds transactions and their proofs, and broadcasts.
+
+| Device | App | Screen and buttons | Link to the phone |
+|---|---|---|---|
+| Flipper Zero | **ZFlip** (`flipper/`) | its own | Bluetooth |
+| Pi Zero 1.3 (no radio) | `zfirm` (`linux/`) | Waveshare 1.3" LCD HAT (the SeedSigner screen) | USB cable, as a network link |
+| Jailbroken Kindle, any Linux board, a computer | `zfirm` (`linux/`) | terminal | local network (TCP) or serial |
+
+Every device runs the same core (`core/`): the checks, the signing and the protocol
+([`session`](core/src/session.rs)); a device only adds a screen, buttons and a link.
 
 ## How a payment works
 
-1. The iPhone, which can see but never spend, builds the transaction (a PCZT) and proves it.
-2. It sends a compact sign request to the Flipper over Bluetooth.
-3. The Flipper checks it against the transaction's commitments itself: who gets what, the fee,
-   and that the change comes back to this wallet.
-4. It shows the payment, the recipient and the fee on its own screen. Hold OK to sign, Back to
-   refuse.
-5. It returns the signatures; the iPhone finishes and broadcasts the transaction.
+1. The phone, which can see but never spend, builds the transaction (a PCZT) and proves it.
+2. It sends a compact sign request to the device.
+3. The device checks it against the transaction's commitments itself: who gets what, the fee,
+   that the change comes back to this wallet, and that each encrypted note decrypts to exactly
+   that note (so neither the recipient nor this wallet can be sent a payment it cannot find).
+4. It shows the payment, the recipient, the memo and the fee on its own screen. Hold OK to
+   sign, Back to refuse.
+5. It returns the signatures; the phone finishes and broadcasts the transaction.
 
-A compromised phone cannot spend without the user seeing the real amount and recipient on the
-Flipper.
+A compromised phone cannot spend without the user seeing the real amount, recipient and memo
+on the device.
 
 ## Security model, and its limits
+
+On the Flipper:
 
 - The 24-word seed is made on the Flipper from its hardware random number generator.
 - It is sealed on the SD card with the PIN (an iterated keyed BLAKE2b) and the Flipper's unique
@@ -36,10 +48,17 @@ Flipper.
   compact SHA-2, PBKDF2, FF1, BIP 39 and BLAKE2b implementations are tested against reference
   implementations but not audited.
 
+On Linux (`linux/`): the seed's entropy is sealed with the PIN (Argon2id, 32 MiB, then
+AES-256-GCM) in a file readable by its owner only; ten wrong PINs wipe it. There is no secure
+element: a copy of the file can be attacked offline, so use a long PIN. On a Pi Zero 1.3 there
+is no radio at all; on a Kindle the link is Wi-Fi, so keep it on a network you trust.
+
 ## Layout
 
-- `core/`: no_std signer core (ZIP 32, Orchard/Ironwood, unified addresses, BIP 39, compact QR,
-  review and signing of a compact sign request). `cargo test --release --features english`.
+- `core/` (`zfirm-core`): no_std signer core (ZIP 32, Orchard/Ironwood, unified addresses,
+  BIP 39, compact QR, review and signing of a compact sign request, the device session).
+  `cargo test --release --features english`.
+- `linux/` (`zfirm-linux`): the `zfirm` app for Linux devices. See [linux/README.md](linux/README.md).
 - `bridge/`: PCZT ↔ sign request glue for the iPhone app (Rust, C FFI).
 - `flipper/`: the Flipper apps (`zflip.fap`, and `zflip_setup.fap` for creating, restoring and
   revealing). `./build.sh` → `dist/`.

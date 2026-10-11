@@ -19,7 +19,7 @@ use pczt::{
 };
 use zcash_address::unified::{self, Container, Encoding};
 use zcash_protocol::PoolType;
-use zflip_core::request::{self, Owner, SignRequest, SpendSignature};
+use zfirm_core::request::{self, Owner, SignRequest, SpendSignature};
 
 pub mod ffi;
 
@@ -27,20 +27,20 @@ pub mod ffi;
 
 /// 24 words from 32 bytes of entropy (the caller's system RNG).
 pub fn mnemonic_new(entropy: &[u8; 32]) -> String {
-    let list = zflip_core::mnemonic::Packed::new(zflip_core::mnemonic::ENGLISH).expect("embedded list");
-    let indices = zflip_core::mnemonic::indices_from_entropy(entropy);
-    zflip_core::mnemonic::sentence(&indices, &list).expect("valid indices")
+    let list = zfirm_core::mnemonic::Packed::new(zfirm_core::mnemonic::ENGLISH).expect("embedded list");
+    let indices = zfirm_core::mnemonic::indices_from_entropy(entropy);
+    zfirm_core::mnemonic::sentence(&indices, &list).expect("valid indices")
 }
 
 /// The BIP 39 seed of a phrase (no passphrase), after checking its words and checksum.
 /// The phrase is normalised: lowercase, single spaces.
 pub fn mnemonic_seed(phrase: &str) -> Result<[u8; 64], Error> {
-    let list = zflip_core::mnemonic::Packed::new(zflip_core::mnemonic::ENGLISH).expect("embedded list");
+    let list = zfirm_core::mnemonic::Packed::new(zfirm_core::mnemonic::ENGLISH).expect("embedded list");
     let lower = phrase.to_lowercase();
-    let indices = zflip_core::mnemonic::parse(&lower, &list).map_err(|_| Error::Mnemonic)?;
-    zflip_core::mnemonic::validate(&indices).map_err(|_| Error::Mnemonic)?;
-    let normal = zflip_core::mnemonic::sentence(&indices, &list).ok_or(Error::Mnemonic)?;
-    Ok(zflip_core::mnemonic::to_seed(&normal, "", |_| {}))
+    let indices = zfirm_core::mnemonic::parse(&lower, &list).map_err(|_| Error::Mnemonic)?;
+    zfirm_core::mnemonic::validate(&indices).map_err(|_| Error::Mnemonic)?;
+    let normal = zfirm_core::mnemonic::sentence(&indices, &list).ok_or(Error::Mnemonic)?;
+    Ok(zfirm_core::mnemonic::to_seed(&normal, "", |_| {}))
 }
 
 /// ZIP 32 seed fingerprint (what hardware wallets and PCZTs identify a seed by).
@@ -88,13 +88,13 @@ pub fn orchard_fvk(ufvk: &str) -> Result<FullViewingKey, Error> {
 pub fn address(ufvk: &str, index: u32) -> Result<String, Error> {
     let (network, _) = unified::Ufvk::decode(ufvk).map_err(|_| Error::Ufvk)?;
     let network = match network {
-        zcash_protocol::consensus::NetworkType::Main => zflip_core::Network::Main,
-        zcash_protocol::consensus::NetworkType::Test => zflip_core::Network::Test,
+        zcash_protocol::consensus::NetworkType::Main => zfirm_core::Network::Main,
+        zcash_protocol::consensus::NetworkType::Test => zfirm_core::Network::Test,
         _ => return Err(Error::Unsupported("regtest")),
     };
     let fvk = orchard_fvk(ufvk)?;
     let addr = fvk.address_at(index, Scope::External);
-    Ok(zflip_core::ua::encode_orchard_address(network, &addr.to_raw_address_bytes()))
+    Ok(zfirm_core::ua::encode_orchard_address(network, &addr.to_raw_address_bytes()))
 }
 
 /// Builds the device request for `pczt_bytes` (before or after proving). `ufvk` is

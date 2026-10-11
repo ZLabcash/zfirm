@@ -27,7 +27,7 @@ use flipperzero::{
 };
 use flipperzero_sys as sys;
 use rand_core::RngCore;
-use zflip_core::{Network, arr};
+use zfirm_core::{Network, arr};
 
 pub const DIR: &CStr = c"/ext/apps_data/zflip";
 pub const PATH: &CStr = c"/ext/apps_data/zflip/wallet.zfv";
@@ -87,10 +87,18 @@ pub struct Secret {
 
 impl Drop for Secret {
     fn drop(&mut self) {
-        for b in self.entropy.iter_mut().chain(self.sk.iter_mut()).chain(self.seed_fp.iter_mut()) {
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
+        zero(&mut self.entropy);
+        zero(&mut self.sk);
+        zero(&mut self.seed_fp);
     }
+}
+
+/// Zeroes key material in a way the compiler cannot drop as a dead store.
+fn zero(bytes: &mut [u8]) {
+    for b in bytes.iter_mut() {
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 impl Secret {
@@ -178,9 +186,8 @@ struct Keys {
 
 impl Drop for Keys {
     fn drop(&mut self) {
-        for b in self.enc.iter_mut().chain(self.mac.iter_mut()) {
-            unsafe { core::ptr::write_volatile(b, 0) };
-        }
+        zero(&mut self.enc);
+        zero(&mut self.mac);
     }
 }
 
@@ -218,20 +225,25 @@ fn derive_keys(pin: &[u8], salt: &[u8; 16], progress: &mut dyn FnMut(u32)) -> Re
         let ok = sys::furi_hal_crypto_encrypt(k.as_ptr(), enc.as_mut_ptr(), 32);
         sys::furi_hal_crypto_enclave_unload_key(UNIQUE_KEY_SLOT);
         if !ok {
+            zero(&mut k);
             return Err(Error::Enclave);
         }
     }
     let keys = Keys { enc, mac: arr(&k[32..]) };
-    k.iter_mut().for_each(|b| *b = 0);
+    zero(&mut k);
+    zero(&mut u);
+    zero(&mut enc);
     Ok(keys)
 }
 
 /// AES-256-CTR on the Flipper's AES engine (its own inverse).
 fn ctr(key: &[u8; 32], iv: &[u8; 16], data: &mut [u8; SECRET_LEN]) -> Result<(), Error> {
-    let input = *data;
+    // When sealing, this copy is the plaintext secret.
+    let mut input = *data;
     let ok = unsafe {
         sys::furi_hal_crypto_ctr(key.as_ptr(), iv.as_ptr(), input.as_ptr(), data.as_mut_ptr(), SECRET_LEN)
     };
+    zero(&mut input);
     if ok { Ok(()) } else { Err(Error::Enclave) }
 }
 
@@ -267,6 +279,7 @@ pub fn seal(
     plain[64..].copy_from_slice(&secret.seed_fp);
     ctr(&keys.enc, &arr(&buf[IV..]), &mut plain)?;
     buf[SECRET..TAG].copy_from_slice(&plain);
+    zero(&mut plain);
     let t = tag(&keys.mac, &*buf);
     buf[TAG..].copy_from_slice(&t);
     write_file(&*buf)
@@ -311,7 +324,7 @@ pub fn unseal(pin: &[u8], progress: &mut dyn FnMut(u32)) -> Result<(Meta, Secret
         return Err(Error::Corrupt);
     }
     let secret = Secret { entropy: arr(&plain), entropy_len, sk: arr(&plain[32..]), seed_fp: arr(&plain[64..]) };
-    plain.iter_mut().for_each(|b| *b = 0);
+    zero(&mut plain);
     Ok((Meta { failed: 0, ..meta }, secret))
 }
 

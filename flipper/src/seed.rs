@@ -6,7 +6,7 @@ use alloc::{string::String, vec::Vec};
 use core::sync::atomic::Ordering;
 
 use flipperzero::{io::Read, storage::OpenOptions};
-use zflip_core::{Account, Network, hash, mnemonic};
+use zfirm_core::{Account, Network, hash, mnemonic};
 
 use crate::{ui::PROGRESS, vault::trace};
 

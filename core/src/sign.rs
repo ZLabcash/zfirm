@@ -10,7 +10,10 @@
 //! - an output the phone calls change (or a self-payment) re-derives to this
 //!   wallet's own address, and an address typed by the user contains the receiver
 //!   actually paid,
-//! - every non-zero spend is authorized by this wallet's key.
+//! - every non-zero spend is authorized by this wallet's key,
+//! - each non-zero output's encrypted note decrypts, with the key its recipient will
+//!   use, to exactly that note (so a phone cannot send a payment, or our own change,
+//!   that its recipient can never find), and its memo is the one shown.
 //!
 //! A phone that lies about a spent note's value cannot make the device sign it: the
 //! output values are fixed by their note commitments and the value commitment fixes
@@ -28,12 +31,14 @@ use orchard::{
     Action as OrchardAction, Address, Anchor, Note, ValuePool,
     bundle::{EffectsOnly, Flags, TxVersion, commitments::hash_bundle_txid_empty},
     keys::{FullViewingKey, SpendAuthorizingKey, SpendValidatingKey},
-    note::{ExtractedNoteCommitment, Nullifier, RandomSeed, Rho, TransmittedNoteCiphertext},
+    note::{ExtractedNoteCommitment, Nullifier, NoteVersion, RandomSeed, Rho, TransmittedNoteCiphertext},
+    note_encryption::{IronwoodDomain, OrchardDomain},
     primitives::redpallas::{self, SpendAuth},
     value::{NoteValue, ValueCommitTrapdoor, ValueCommitment},
 };
 use pasta_curves::{group::ff::PrimeField, pallas};
 use rand_core::{CryptoRng, RngCore};
+use zcash_note_encryption::{Domain, try_output_recovery_with_pkd_esk};
 use crate::{
     Network,
     request::{self, Owner, SignRequest, SpendSignature},
@@ -93,6 +98,8 @@ pub struct Payment {
     pub address: String,
     pub value: u64,
     pub ironwood: bool,
+    /// The memo's text, `None` when the memo is empty.
+    pub memo: Option<String>,
 }
 
 /// Everything the user confirms before signing. Amounts are in zatoshis.
@@ -116,6 +123,30 @@ impl Review {
     pub fn total_out(&self) -> u64 {
         self.payments.iter().map(|p| p.value).sum::<u64>() + self.fee
     }
+
+    /// Pages to show: each payment, then its memo if it has one, then the confirmation.
+    pub fn pages(&self) -> u8 {
+        let pages: usize = self.payments.iter().map(|p| 1 + p.memo.is_some() as usize).sum();
+        (pages + 1).min(u8::MAX as usize) as u8
+    }
+
+    /// The payment on `page` and whether it is its memo page; `None` for the confirmation.
+    pub fn page(&self, page: u8) -> Option<(usize, bool)> {
+        let mut n = 0;
+        for (i, p) in self.payments.iter().enumerate() {
+            if n == page {
+                return Some((i, false));
+            }
+            n += 1;
+            if p.memo.is_some() {
+                if n == page {
+                    return Some((i, true));
+                }
+                n += 1;
+            }
+        }
+        None
+    }
 }
 
 /// Checks `req` and returns what the user must confirm.
@@ -127,6 +158,20 @@ pub fn review(req: &SignRequest, account: &impl Wallet) -> Result<Review, Error>
         ..Review::default()
     };
     let mut fee: i128 = 0;
+
+    // Spend authorizations first, so a request for another wallet is always reported
+    // as such, whatever the (shuffled) order of its actions.
+    for action in req.bundles.iter().flat_map(|b| &b.actions) {
+        if action.spend_value > 0 {
+            let alpha = scalar(&action.alpha)?;
+            let rk: [u8; 32] = (&ak.randomize(&alpha)).into();
+            if rk != action.rk {
+                return Err(Error::NotMine);
+            }
+            review.spent = review.spent.checked_add(action.spend_value).ok_or(Error::ValueOverflow)?;
+            review.spends += 1;
+        }
+    }
 
     for bundle in &req.bundles {
         let bundle_version = request::bundle_version(bundle.version).ok_or(Error::Parse)?;
@@ -141,17 +186,6 @@ pub fn review(req: &SignRequest, account: &impl Wallet) -> Result<Review, Error>
                 return Err(Error::Verification);
             }
             balance += action.spend_value as i128 - action.output_value as i128;
-
-            // Spend authorization.
-            if action.spend_value > 0 {
-                let alpha = scalar(&action.alpha)?;
-                let rk: [u8; 32] = (&ak.randomize(&alpha)).into();
-                if rk != action.rk {
-                    return Err(Error::NotMine);
-                }
-                review.spent = review.spent.checked_add(action.spend_value).ok_or(Error::ValueOverflow)?;
-                review.spends += 1;
-            }
 
             // Note commitment.
             let recipient = Option::from(Address::from_raw_address_bytes(&action.output_recipient))
@@ -170,6 +204,12 @@ pub fn review(req: &SignRequest, account: &impl Wallet) -> Result<Review, Error>
             if ExtractedNoteCommitment::from(note.commitment()).to_bytes() != action.cmx {
                 return Err(Error::Verification);
             }
+            // Dummy outputs carry nothing; every other one must reach its recipient.
+            let memo = if action.output_value > 0 {
+                memo_text(&check_ciphertext(action, &note, note_version)?)
+            } else {
+                None
+            };
 
             // Whose output is it?
             let value = action.output_value;
@@ -183,6 +223,7 @@ pub fn review(req: &SignRequest, account: &impl Wallet) -> Result<Review, Error>
                         address: display_address(account, &action.user_address, &recipient)?,
                         value,
                         ironwood: bundle.is_ironwood(),
+                        memo,
                     });
                     continue;
                 }
@@ -250,6 +291,57 @@ pub fn sign_reviewed<R: RngCore + CryptoRng>(
         return Err(Error::NothingToSign);
     }
     Ok(sigs)
+}
+
+/// Decrypts the action's output with the key its recipient derives (from the note's
+/// own `esk`, as the sender) and checks it holds exactly `note`: the plaintext, the
+/// ephemeral key and the note commitment. Returns the memo.
+fn check_ciphertext(action: &request::Action, note: &Note, version: NoteVersion) -> Result<[u8; 512], Error> {
+    let output = OrchardAction::from_parts(
+        Option::from(Nullifier::from_bytes(&action.nullifier)).ok_or(Error::Parse)?,
+        redpallas::VerificationKey::try_from(action.rk).map_err(|_| Error::Parse)?,
+        Option::from(ExtractedNoteCommitment::from_bytes(&action.cmx)).ok_or(Error::Parse)?,
+        TransmittedNoteCiphertext {
+            epk_bytes: action.epk,
+            enc_ciphertext: action.enc_ciphertext.as_slice().try_into().map_err(|_| Error::Parse)?,
+            out_ciphertext: action.out_ciphertext,
+        },
+        Option::from(ValueCommitment::from_bytes(&action.cv_net)).ok_or(Error::Parse)?,
+        (),
+    )
+    .map_err(|_| Error::Parse)?;
+    fn recover<D: Domain<Note = Note, Memo = [u8; 512]>>(
+        domain: &D,
+        note: &Note,
+        output: &OrchardAction<()>,
+    ) -> Option<[u8; 512]>
+    where
+        OrchardAction<()>: zcash_note_encryption::ShieldedOutput<D, { zcash_note_encryption::ENC_CIPHERTEXT_SIZE }>,
+    {
+        let esk = D::derive_esk(note)?;
+        let (decrypted, _, memo) = try_output_recovery_with_pkd_esk(domain, D::get_pk_d(note), esk, output)?;
+        (decrypted == *note).then_some(memo)
+    }
+    match version {
+        NoteVersion::V2 => recover(&OrchardDomain::for_action(&output), note, &output),
+        NoteVersion::V3 => recover(&IronwoodDomain::for_action(&output), note, &output),
+    }
+    .ok_or(Error::Verification)
+}
+
+/// A memo as text (ZIP 302): `None` if empty, a marker if it is not text.
+fn memo_text(memo: &[u8; 512]) -> Option<String> {
+    match memo[0] {
+        0xF6 if memo[1..].iter().all(|&b| b == 0) => None,
+        0..=0xF4 => {
+            let end = memo.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+            Some(match core::str::from_utf8(&memo[..end]) {
+                Ok(text) => String::from(text),
+                Err(_) => String::from("[unreadable memo]"),
+            })
+        }
+        _ => Some(String::from("[binary memo]")),
+    }
 }
 
 fn scalar(bytes: &[u8; 32]) -> Result<pallas::Scalar, Error> {

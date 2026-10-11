@@ -39,8 +39,8 @@ fn provider(j: u32) -> Option<pallas::Affine> {
             return None;
         }
     }
-    let x = Option::from(pallas::Base::from_repr(zflip_core::arr(&buf)))?;
-    let y = Option::from(pallas::Base::from_repr(zflip_core::arr(&buf[32..])))?;
+    let x = Option::from(pallas::Base::from_repr(zfirm_core::arr(&buf)))?;
+    let y = Option::from(pallas::Base::from_repr(zfirm_core::arr(&buf[32..])))?;
     Option::from(pallas::Affine::from_xy(x, y))
 }
 

@@ -11,7 +11,7 @@ use zcash_keys::{
     keys::{UnifiedFullViewingKey, UnifiedSpendingKey},
 };
 use zcash_protocol::consensus::{MAIN_NETWORK, TEST_NETWORK};
-use zflip_core::{
+use zfirm_core::{
     Account, Network, ff1, hash,
     mnemonic::{self, ENGLISH, Packed, WordList},
     protocol::{self, Decoder, Info},
@@ -185,7 +185,7 @@ fn frames_survive_any_packet_split() {
 fn ua_codec_matches_zcash_address() {
     use zcash_address::unified::{self, Container, Encoding};
     use zcash_protocol::consensus::NetworkType;
-    use zflip_core::ua;
+    use zfirm_core::ua;
     for (network, nt) in [(Network::Main, NetworkType::Main), (Network::Test, NetworkType::Test)] {
         for _ in 0..20 {
             let account = Account::from_seed(&random::<32>(), network, 0).unwrap();
@@ -234,9 +234,101 @@ fn account_rebuilds_from_its_spending_key() {
 fn signing_key_derives_the_same_addresses() {
     let a = Account::from_seed(&random::<64>(), Network::Main, 0).unwrap();
     let change = a.address_in(Scope::Internal, 0).to_raw_address_bytes();
-    let key = zflip_core::account::SigningKey::from_parts(Network::Main, a.sk_bytes(), a.seed_fingerprint(), change).unwrap();
+    let key = zfirm_core::account::SigningKey::from_parts(Network::Main, a.sk_bytes(), a.seed_fingerprint(), change).unwrap();
     let ivk = key.external_ivk();
     for j in [0u32, 19, 20, 12345] {
-        assert_eq!(zflip_core::account::address_at(&ivk, j), a.address(j));
+        assert_eq!(zfirm_core::account::address_at(&ivk, j), a.address(j));
+    }
+}
+
+#[test]
+fn entropy_and_words_round_trip_for_every_length() {
+    use zfirm_core::mnemonic;
+    for len in [16, 20, 24, 28, 32] {
+        let entropy: Vec<u8> = (0..len as u8).map(|i| i.wrapping_mul(37).wrapping_add(11)).collect();
+        let indices = mnemonic::indices_for(&entropy).unwrap();
+        assert_eq!(indices.len(), len * 3 / 4);
+        assert_eq!(mnemonic::entropy_of(&indices).unwrap(), entropy);
+        // Same words as the bip39 crate.
+        let reference = bip39::Mnemonic::from_entropy(&entropy).unwrap();
+        let ours = mnemonic::sentence(&indices, &mnemonic::Packed::new(mnemonic::ENGLISH).unwrap()).unwrap();
+        assert_eq!(ours, reference.to_string());
+    }
+    let full: [u8; 32] = core::array::from_fn(|i| i as u8);
+    assert_eq!(mnemonic::indices_for(&full).unwrap(), mnemonic::indices_from_entropy(&full).to_vec());
+}
+
+/// Hostile bytes from the phone never crash the decoders: random frames, and every
+/// truncation and many bit flips of a real sign request.
+#[test]
+fn decoders_survive_hostile_input() {
+    use rand_core::{OsRng, RngCore};
+    use zfirm_core::{protocol::{Decoder, Info}, request::{self, SignRequest}};
+
+    let mut rng = OsRng;
+    for _ in 0..20_000 {
+        let mut bytes = vec![0u8; (rng.next_u32() % 2048) as usize];
+        rng.fill_bytes(&mut bytes);
+        if rng.next_u32() % 2 == 0 && bytes.len() >= 7 {
+            // Often a valid header, so the payload decoders get exercised too.
+            bytes[0] = zfirm_core::protocol::MAGIC;
+            bytes[1] = zfirm_core::protocol::VERSION;
+            let len = (bytes.len() - 7) as u32;
+            bytes[3..7].copy_from_slice(&len.to_le_bytes());
+        }
+        let mut decoder = Decoder::new();
+        if let Ok(Some(frame)) = decoder.push(&bytes) {
+            let _ = SignRequest::decode(&frame.payload);
+            let _ = Info::decode(&frame.payload);
+            let _ = request::decode_signatures(&frame.payload);
+            let _ = zfirm_core::protocol::decode_address(&frame.payload);
+            let _ = zfirm_core::protocol::decode_error(&frame.payload);
+        }
+    }
+
+    // A structurally valid request: one bundle, two actions.
+    let action = request::Action {
+        cv_net: [1; 32],
+        nullifier: [2; 32],
+        rk: [3; 32],
+        cmx: [4; 32],
+        epk: [5; 32],
+        enc_ciphertext: vec![6; request::ENC_CIPHERTEXT_SIZE],
+        out_ciphertext: [7; request::OUT_CIPHERTEXT_SIZE],
+        rcv: [8; 32],
+        spend_value: 9,
+        alpha: [10; 32],
+        output_recipient: [11; 43],
+        output_value: 12,
+        output_rseed: [13; 32],
+        owner: request::Owner::Internal(0),
+        user_address: "u1test".into(),
+    };
+    let req = SignRequest {
+        tx_version: 6,
+        version_group_id: 1,
+        branch_id: 2,
+        lock_time: 0,
+        expiry_height: 3,
+        bundles: vec![request::Bundle {
+            version: request::version::IRONWOOD_V3,
+            flags: 3,
+            value_balance: 1,
+            anchor: [14; 32],
+            actions: vec![action.clone(), action],
+        }],
+    };
+    let good = req.encode();
+    assert_eq!(SignRequest::decode(&good), Some(req));
+    for cut in 0..good.len() {
+        assert!(SignRequest::decode(&good[..cut]).is_none());
+    }
+    for _ in 0..20_000 {
+        let mut bad = good.clone();
+        for _ in 0..1 + rng.next_u32() % 4 {
+            let i = (rng.next_u32() as usize) % bad.len();
+            bad[i] ^= 1 << (rng.next_u32() % 8);
+        }
+        let _ = SignRequest::decode(&bad);
     }
 }

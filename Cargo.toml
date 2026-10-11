@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "bridge"]
+members = ["core", "bridge", "linux"]
 exclude = ["flipper", "vendor"]
 
 # Device builds need Sinsemilla without its 64 KiB generator table and pasta_curves

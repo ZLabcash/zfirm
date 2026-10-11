@@ -1,7 +1,7 @@
 //! The compact QR encoder must produce exactly what qrcodegen does for the same
 //! version, level L and mask 0.
 use qrcodegen::{Mask, QrCode, QrCodeEcc, QrSegment, Version};
-use zflip_core::{Account, Network, qr::Qr};
+use zfirm_core::{Account, Network, qr::Qr};
 
 fn reference(data: &[u8], version: u8) -> QrCode {
     let segs = [QrSegment::make_bytes(data)];

@@ -30,7 +30,7 @@ use core::{ffi::CStr, sync::atomic::Ordering};
 use flipperzero::furi::rng::HwRng;
 use flipperzero_rt::{entry, manifest};
 use rand_core::RngCore;
-use zflip_core::{Network, mnemonic};
+use zfirm_core::{Network, mnemonic};
 
 use crate::{
     gfx::{Font, Gfx},
@@ -408,7 +408,7 @@ fn pin_entered(s: &mut State, worker: &mut Worker<Job>, purpose: PinFor, pin: Ve
                 Job::ViewKey(vault::unseal(&pin, &mut |p| PROGRESS.store(p, Ordering::Relaxed)).and_then(
                     |(meta, secret)| {
                         let key = stable::with(|| {
-                            zflip_core::account::SigningKey::from_parts(meta.network, secret.sk, secret.seed_fp, meta.change)
+                            zfirm_core::account::SigningKey::from_parts(meta.network, secret.sk, secret.seed_fp, meta.change)
                         })
                         .ok_or(vault::Error::Corrupt)?;
                         let text = key.ufvk();

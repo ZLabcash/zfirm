@@ -18,7 +18,7 @@ for line in sys.stdin:
     if len(p) < 4: continue
     size, kind, name = int(p[1]), p[2], p[3].strip()
     rows.append((size, name))
-    m = re.findall(r"(zflip_core::sign|zflip_core::request|zflip_core::account|zflip_core|zflip_sign|zflip::|qrcodegen|orchard|pasta_curves|blake2b|sinsemilla|zcash_address|f4jumble|bech32|aes|fpe|reddsa|core::fmt|alloc::|compiler_builtins|flipperzero|core::)", name)
+    m = re.findall(r"(zfirm_core::sign|zfirm_core::request|zfirm_core::account|zfirm_core|zflip_sign|zflip::|qrcodegen|orchard|pasta_curves|blake2b|sinsemilla|zcash_address|f4jumble|bech32|aes|fpe|reddsa|core::fmt|alloc::|compiler_builtins|flipperzero|core::)", name)
     c[m[0] if m else "other"] += size
 for k, v in c.most_common(): print(f"{k:28}{v:>7}")
 print("--- largest")

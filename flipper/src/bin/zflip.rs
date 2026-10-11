@@ -4,7 +4,7 @@
 //! it opens and on each press of ▶ (as a QR code and text), and keeps a Bluetooth link to the ZFlip iPhone app for as long as it is
 //! open: the phone gets the viewing key once the user agrees, follows the address
 //! shown here, and sends transactions that ZFlip checks against their commitments
-//! (see `zflip_core::sign`), shows, and signs only on a long press of OK.
+//! (see `zfirm_core::sign`), shows, and signs only on a long press of OK.
 //!
 //! Creating or restoring a wallet, showing its words and switching networks live
 //! in a setup module launched on demand (see `launch.rs`): together they would not
@@ -42,11 +42,12 @@ use flipperzero::{
 };
 use flipperzero_rt::{entry, manifest};
 use flipperzero_sys as sys;
-use zflip_core::{
+use zfirm_core::{
     Network,
     account::SigningKey,
-    protocol::{self, Decoder, Info, error, msg, status},
-    request::{self, SignRequest},
+    protocol::{self, Decoder, Info, error, msg},
+    request::SpendSignature,
+    session::{self, Show, Work},
     sign::{self, Review},
 };
 
@@ -114,13 +115,27 @@ enum Job {
     Opened(Result<(vault::Meta, Arc<SigningKey>, Arc<orchard::keys::IncomingViewingKey>), vault::Error>),
     Address(u32, String, Option<Qr>),
     Reviewed(Result<Review, sign::Error>),
-    Signed(Result<Vec<u8>, sign::Error>),
+    Signed(Result<Vec<SpendSignature>, sign::Error>),
 }
 
 struct Session {
     link: Option<ble::Link>,
     decoder: Decoder,
-    request: Option<Arc<SignRequest>>,
+    /// The protocol itself, shared with every ZFirm device.
+    core: session::Session,
+}
+
+/// What the shared session needs to know about this Flipper's wallet.
+struct Host<'a>(&'a State);
+
+impl session::Host for Host<'_> {
+    fn info(&self) -> Option<Info> {
+        info(self.0)
+    }
+
+    fn address(&self) -> Option<(u32, String)> {
+        self.0.address.as_ref().map(|(j, text, _)| (*j, text.clone()))
+    }
 }
 
 fn main(_args: Option<&CStr>) -> i32 {
@@ -154,7 +169,7 @@ fn main(_args: Option<&CStr>) -> i32 {
         },
         draw,
     );
-    let mut session = Session { link: None, decoder: Decoder::new(), request: None };
+    let mut session = Session { link: None, decoder: Decoder::new(), core: session::Session::new() };
     loop {
         let key = shell.next_key();
         if let Some(job) = worker.poll() {
@@ -223,6 +238,49 @@ fn reply_error(session: &Session, code: u8, message: &str) {
     reply(session, msg::ERROR, &protocol::encode_error(code, message));
 }
 
+/// Carries out a step of the shared session: frames out, screen, work on the worker.
+fn apply(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session, step: session::Step) {
+    if let Some(link) = &session.link {
+        for frame in &step.send {
+            link.send(frame);
+        }
+    }
+    let mut s = shell.state.lock();
+    s.paired = session.core.paired();
+    let account = s.account.clone();
+    match step.show {
+        Some(Show::PairPrompt) => {
+            interrupt(&mut s, Screen::PairPrompt);
+            drop(s);
+            shell.attention();
+        }
+        Some(Show::Busy(label)) => interrupt(&mut s, Screen::Busy(label)),
+        Some(Show::Review(review)) => {
+            s.review = Some(review);
+            s.screen = Screen::Review(0);
+            drop(s);
+            shell.attention();
+        }
+        Some(Show::Done { ok, note }) => {
+            s.review = None;
+            s.note = note;
+            s.screen = Screen::Done { ok };
+            drop(s);
+            if ok { shell.success() } else { shell.error() }
+        }
+        Some(Show::Resume) => s.screen = s.resume,
+        None => {}
+    }
+    let Some(account) = account else { return };
+    match step.work {
+        Some(Work::Review(req)) => worker.spawn(move || Job::Reviewed(stable::with(|| sign::review(&req, &*account)))),
+        Some(Work::Sign(req)) => {
+            worker.spawn(move || Job::Signed(stable::with(|| sign::sign_reviewed(&req, &*account, HwRng))))
+        }
+        None => {}
+    }
+}
+
 /// Moves on to a fresh address (the next index) and derives it, QR included, on
 /// the worker; the paired iPhone follows. Old ones still receive, but are never
 /// shown again.
@@ -235,8 +293,8 @@ fn new_address(s: &mut State, worker: &mut Worker<Job>, show: bool) {
         s.screen = Screen::Busy("Forging address");
     }
     worker.spawn(move || {
-        let raw = stable::with(|| zflip_core::account::address_at(&ivk, j)).to_raw_address_bytes();
-        let text = zflip_core::ua::encode_orchard_address(meta.network, &raw);
+        let raw = stable::with(|| zfirm_core::account::address_at(&ivk, j)).to_raw_address_bytes();
+        let text = zfirm_core::ua::encode_orchard_address(meta.network, &raw);
         let qr = Qr::address(&text);
         Job::Address(j, text, qr)
     });
@@ -280,44 +338,21 @@ fn finish(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session,
         Job::Address(j, text, qr) => {
             let mut s = shell.state.lock();
             let showing = s.screen == Screen::Busy("Forging address");
-            let paired = s.paired;
             s.address = Some((j, text.clone(), qr));
             if showing {
                 s.screen = Screen::Receive { text: false };
             }
             drop(s);
-            if paired {
-                reply(session, msg::ADDRESS, &protocol::encode_address(j, &text));
-            }
+            let step = session.core.address_changed(j, &text);
+            apply(shell, worker, session, step);
         }
-        Job::Reviewed(Ok(review)) => {
-            {
-                let mut s = shell.state.lock();
-                s.review = Some(review);
-                s.screen = Screen::Review(0);
-            }
-            reply(session, msg::STATUS, &[status::AWAITING_USER]);
-            shell.attention();
+        Job::Reviewed(result) => {
+            let step = session.core.reviewed(result);
+            apply(shell, worker, session, step);
         }
-        Job::Reviewed(Err(e)) | Job::Signed(Err(e)) => {
-            session.request = None;
-            reply_error(session, error::INVALID_TX, e.message());
-            let mut s = shell.state.lock();
-            s.review = None;
-            s.note = e.message();
-            s.screen = Screen::Done { ok: false };
-            drop(s);
-            shell.error();
-        }
-        Job::Signed(Ok(sigs)) => {
-            session.request = None;
-            reply(session, msg::SIGNED, &sigs);
-            let mut s = shell.state.lock();
-            s.review = None;
-            s.note = "Signed: phone sends it";
-            s.screen = Screen::Done { ok: true };
-            drop(s);
-            shell.success();
+        Job::Signed(result) => {
+            let step = session.core.signed(result);
+            apply(shell, worker, session, step);
         }
     }
 }
@@ -446,53 +481,25 @@ fn input(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session, 
             _ => {}
         },
         Screen::PairPrompt => match k {
-            Key::Ok => {
-                s.paired = true;
-                s.screen = s.resume;
-                let info = info(&s);
-                let address = s.address.as_ref().map(|(j, a, _)| protocol::encode_address(*j, a));
+            Key::Ok | Key::Back => {
+                let step = session.core.answer(k == Key::Ok, &Host(&s));
                 drop(s);
-                if let Some(info) = info {
-                    reply(session, msg::INFO, &info.encode());
+                apply(shell, worker, session, step);
+                if k == Key::Ok {
+                    shell.success();
                 }
-                if let Some(address) = address {
-                    reply(session, msg::ADDRESS, &address);
-                }
-                shell.success();
-            }
-            Key::Back => {
-                s.screen = s.resume;
-                drop(s);
-                reply_error(session, error::REJECTED, "Refused on the Flipper");
             }
             _ => {}
         },
         Screen::Review(page) => {
-            let pages = s.review.as_ref().map_or(1, |r| r.payments.len() as u8 + 1);
+            let pages = s.review.as_ref().map_or(1, Review::pages);
             match k {
                 Key::Right | Key::Ok if page + 1 < pages => s.screen = Screen::Review(page + 1),
                 Key::Left if page > 0 => s.screen = Screen::Review(page - 1),
-                Key::LongOk if page + 1 == pages => {
-                    let (Some(req), Some(account)) = (session.request.clone(), s.account.clone()) else {
-                        return true;
-                    };
-                    s.screen = Screen::Busy("Signing");
+                Key::LongOk | Key::Back | Key::LongBack if k != Key::LongOk || page + 1 == pages => {
+                    let step = session.core.answer(k == Key::LongOk, &Host(&s));
                     drop(s);
-                    reply(session, msg::STATUS, &[status::WORKING]);
-                    worker.spawn(move || {
-                        Job::Signed(
-                            stable::with(|| sign::sign_reviewed(&req, &*account, HwRng))
-                                .map(|sigs| request::encode_signatures(&sigs)),
-                        )
-                    });
-                }
-                Key::Back | Key::LongBack => {
-                    session.request = None;
-                    s.review = None;
-                    s.note = "Refused";
-                    s.screen = Screen::Done { ok: false };
-                    drop(s);
-                    reply_error(session, error::REJECTED, "Refused on the Flipper");
+                    apply(shell, worker, session, step);
                 }
                 _ => {}
             }
@@ -546,14 +553,15 @@ fn poll_link(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Sessi
     let Some(connected) = session.link.as_ref().map(|l| l.connected()) else { return };
     {
         let mut s = shell.state.lock();
-        if s.connected && !connected {
-            // A new connection must be approved again.
-            s.paired = false;
-            if s.screen == Screen::PairPrompt {
-                s.screen = s.resume;
-            }
-        }
+        let dropped = s.connected && !connected;
         s.connected = connected;
+        drop(s);
+        if dropped {
+            // A new connection must be approved again.
+            session.decoder.reset();
+            let step = session.core.disconnected();
+            apply(shell, worker, session, step);
+        }
     }
     let mut buf = [0u8; 256];
     loop {
@@ -567,46 +575,20 @@ fn poll_link(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Sessi
             next = session.decoder.next();
         }
         if next.is_err() {
-            reply_error(session, error::BAD_REQUEST, "Bad frame");
+            let step = session.core.bad_frame();
+            apply(shell, worker, session, step);
         }
     }
 }
 
 fn handle(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session, f: protocol::Frame) {
-    let (paired, account) = {
-        let s = shell.state.lock();
-        (s.paired, s.account.clone())
-    };
-    match f.kind {
-        msg::PING => reply(session, msg::PONG, &[]),
-        msg::HELLO if paired => {
-            let info = info(&shell.state.lock());
-            if let Some(info) = info {
-                reply(session, msg::INFO, &info.encode());
-            }
-        }
-        msg::HELLO => {
-            if worker.busy() || session.request.is_some() {
-                return reply_error(session, error::BUSY, "Busy");
-            }
-            interrupt(&mut shell.state.lock(), Screen::PairPrompt);
-            reply(session, msg::STATUS, &[status::AWAITING_USER]);
-            shell.attention();
-        }
-        _ if !paired => reply_error(session, error::NOT_PAIRED, "Say hello first"),
-        msg::SIGN if worker.busy() || session.request.is_some() => reply_error(session, error::BUSY, "Busy"),
-        msg::SIGN => {
-            let (Some(req), Some(account)) = (SignRequest::decode(&f.payload), account) else {
-                return reply_error(session, error::BAD_REQUEST, "Bad request");
-            };
-            let req = Arc::new(req);
-            session.request = Some(req.clone());
-            interrupt(&mut shell.state.lock(), Screen::Busy("Checking transaction"));
-            reply(session, msg::STATUS, &[status::WORKING]);
-            worker.spawn(move || Job::Reviewed(stable::with(|| sign::review(&req, &*account))));
-        }
-        _ => reply_error(session, error::BAD_REQUEST, "Unknown message"),
+    // The worker may be busy with an address: anything that needs it waits.
+    let needs_worker = f.kind == msg::SIGN || (f.kind == msg::HELLO && !session.core.paired());
+    if needs_worker && worker.busy() {
+        return reply_error(session, error::BUSY, "Busy");
     }
+    let step = session.core.frame(f, &Host(&shell.state.lock()));
+    apply(shell, worker, session, step);
 }
 
 fn menu(g: &Gfx, items: &[&str], sel: u8, x: i32, y0: i32, step: i32) {
@@ -739,11 +721,20 @@ fn draw(g: &Gfx, s: &State) {
         }
         Screen::Review(page) => {
             let Some(r) = &s.review else { return };
-            if let Some(p) = r.payments.get(page as usize) {
-                g.title(&["Send ", &gfx::num(page as u64 + 1), "/", &gfx::num(r.payments.len() as u64)].concat());
-                g.font(Font::Big);
-                g.center(24, &zec(p.value));
-                g.wrapped(1, 33, &p.address, 21, 0, 3);
+            if let Some((i, memo)) = r.page(page) {
+                let p = &r.payments[i];
+                let of = ["/", &gfx::num(r.payments.len() as u64)].concat();
+                if memo {
+                    // The memo was decrypted from the transaction itself, so it is what Bob reads.
+                    g.title(&["Memo ", &gfx::num(i as u64 + 1), &of].concat());
+                    let text = p.memo.as_deref().map(printable).unwrap_or_default();
+                    g.wrapped(1, 20, &text, 21, 0, 5);
+                } else {
+                    g.title(&["Send ", &gfx::num(i as u64 + 1), &of].concat());
+                    g.font(Font::Big);
+                    g.center(24, &zec(p.value));
+                    g.wrapped(1, 33, &p.address, 21, 0, 3);
+                }
                 g.hints("< >", "OK: next");
             } else {
                 // What leaves the wallet, plainly. The change coming back was checked in the
@@ -776,4 +767,16 @@ fn draw(g: &Gfx, s: &State) {
         }
         Screen::Message(text) => ui::draw_message(g, text),
     }
+}
+
+
+/// The Flipper's fonts are ASCII: anything else shows as `?`, line breaks as spaces.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            ' '..='~' => c,
+            '\n' | '\r' | '\t' => ' ',
+            _ => '?',
+        })
+        .collect()
 }

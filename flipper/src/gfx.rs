@@ -231,7 +231,7 @@ impl Qr {
 
     /// Addresses: the compact encoder (versions 1 to 6), cheap in code size.
     pub fn address(text: &str) -> Option<Qr> {
-        let qr = zflip_core::qr::Qr::encode(text.as_bytes())?;
+        let qr = zfirm_core::qr::Qr::encode(text.as_bytes())?;
         Some(Qr::from_modules(qr.size as i32, |x, y| qr.get(x as usize, y as usize)))
     }
 
@@ -284,8 +284,8 @@ pub fn num(n: u64) -> alloc::string::String {
 
 /// "1.2345 ZEC" from zatoshis, trimming trailing zeros (at least 2 decimals).
 pub fn zec(zats: u64) -> alloc::string::String {
-    let whole = zats / zflip_core::COIN;
-    let mut frac = zats % zflip_core::COIN;
+    let whole = zats / zfirm_core::COIN;
+    let mut frac = zats % zfirm_core::COIN;
     let mut digits = 8;
     while digits > 2 && frac % 10 == 0 {
         frac /= 10;

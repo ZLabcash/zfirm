@@ -40,7 +40,7 @@ qrcodegen-no-heap = "1.8"
 blake2b_simd = { version = "1", default-features = false, features = ["uninline_portable"] }
 sinsemilla = "0.1"
 rand_core = { version = "0.6", default-features = false }
-zflip-core = { path = "../core" }
+zfirm-core = { path = "../core" }
 
 [patch.crates-io]
 pasta_curves = { path = "../vendor/pasta_curves" }

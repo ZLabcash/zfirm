@@ -4,7 +4,7 @@
 
 use std::ffi::{CStr, c_char};
 
-use zflip_core::request;
+use zfirm_core::request;
 
 /// A byte buffer handed to the caller.
 #[repr(C)]

@@ -1,9 +1,12 @@
-//! Zcash shielded signer core for ZFlip, the Flipper Zero wallet.
+//! ZFirm: the Zcash shielded signer core shared by every ZFirm device (ZFlip on the
+//! Flipper Zero, a Pi Zero, a jailbroken Kindle, any Linux board).
 //!
-//! Everything here runs on the Flipper (`no_std` + `alloc`, Cortex-M4, ~100 KiB of
-//! RAM for the whole app) and on the host for tests. The device holds the seed; a
-//! companion phone holds only the viewing key, builds transactions, and sends the
-//! device a compact [`request::SignRequest`] to check and sign.
+//! Everything here is `no_std` + `alloc` and fits a Flipper app (Cortex-M4, ~100 KiB
+//! of RAM for the whole app). The device holds the seed; a companion phone holds only
+//! the viewing key, builds transactions, and sends the device a compact
+//! [`request::SignRequest`] to check ([`sign::review`]), show and sign. The protocol
+//! itself, from pairing to signatures, is [`session`]: a device only adds a screen,
+//! buttons and a link.
 
 #![no_std]
 
@@ -16,6 +19,7 @@ pub mod mnemonic;
 pub mod protocol;
 pub mod qr;
 pub mod request;
+pub mod session;
 pub mod sign;
 pub mod ua;
 
