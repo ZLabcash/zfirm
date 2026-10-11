@@ -1,0 +1,29 @@
+[package]
+name = "zfirm-wifi-board"
+version = "0.1.0"
+edition = "2021"
+description = "ZFirm Wi-Fi board: firmware for the Flipper Zero Wi-Fi devboard (ESP32-S2) that tracks signed transactions, the ZEC price and the network through the ZScan API"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[[bin]]
+name = "zfirm-wifi-board"
+harness = false
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[dependencies]
+anyhow = "1"
+embedded-svc = "0.29"
+esp-idf-svc = "0.53"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+embuild = "0.33"

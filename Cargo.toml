@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["core", "bridge", "linux"]
-exclude = ["flipper", "vendor"]
+exclude = ["flipper", "vendor", "wifi-board"]
 
 # Device builds need Sinsemilla without its 64 KiB generator table and pasta_curves
 # without its 29 KiB sqrt tables (see vendor/): a Flipper app lives in ~100 KiB of RAM.

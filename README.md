@@ -17,6 +17,11 @@ it syncs, builds transactions and their proofs, and broadcasts.
 | Pi Zero 1.3 (no radio) | `zfirm` (`linux/`) | Waveshare 1.3" LCD HAT (the SeedSigner screen) | USB cable, as a network link |
 | Jailbroken Kindle, any Linux board, a computer | `zfirm` (`linux/`) | terminal | local network (TCP) or serial |
 
+Add-on: the **Flipper Wi-Fi devboard** (`wifi-board/`). Plugged into the Flipper, it lets ZFlip
+follow each transaction it signs (mempool, block, confirmations), show the total in dollars
+before signing, and show the network's state. It holds no key. See
+[wifi-board/README.md](wifi-board/README.md).
+
 Every device runs the same core (`core/`): the checks, the signing and the protocol
 ([`session`](core/src/session.rs)); a device only adds a screen, buttons and a link.
 
@@ -60,8 +65,10 @@ is no radio at all; on a Kindle the link is Wi-Fi, so keep it on a network you t
   `cargo test --release --features english`.
 - `linux/` (`zfirm-linux`): the `zfirm` app for Linux devices. See [linux/README.md](linux/README.md).
 - `bridge/`: PCZT ↔ sign request glue for the iPhone app (Rust, C FFI).
-- `flipper/`: the Flipper apps (`zflip.fap`, and `zflip_setup.fap` for creating, restoring and
-  revealing). `./build.sh` → `dist/`.
+- `flipper/`: the Flipper app, ZFlip (`zflip.fap`, and `zflip_setup.fap`, a module it launches
+  for creating, restoring and revealing). `./build.sh` → `dist/` (Rust nightly: the standard
+  library is rebuilt without panic messages to fit the Flipper's RAM).
+- `wifi-board/`: firmware for the Flipper Wi-Fi devboard (ESP32-S2, Rust on ESP-IDF).
 - `dolphin/`: zkSNARKs desktop animations and the NFT gallery pack.
 - `vendor/`: `pasta_curves`, `sinsemilla` and a compact `blake2b_simd`, trimmed for a Flipper
   app's ~100 KiB of RAM.

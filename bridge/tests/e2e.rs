@@ -320,6 +320,8 @@ fn signed_pczt_extracts_to_a_valid_transaction() {
         .finish();
         let tx = TransactionExtractor::new(proven).extract().unwrap();
         assert_eq!(u32::from(tx.expiry_height()), 10_000_040);
+        // The device knows the txid the network will show (for the Wi-Fi board to track).
+        assert_eq!(hex::encode(sign::txid(&req).unwrap()), tx.txid().to_string());
     }
 }
 

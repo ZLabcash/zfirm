@@ -803,6 +803,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "blake2b_simd",
+ "chacha20poly1305",
  "f4jumble",
  "nonempty",
  "orchard",

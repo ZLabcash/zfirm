@@ -31,6 +31,8 @@ mod sync;
 mod ui;
 #[path = "../vault.rs"]
 mod vault;
+#[path = "../wifi.rs"]
+mod wifi;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::{ffi::CStr, sync::atomic::Ordering};
@@ -52,7 +54,7 @@ use zfirm_core::{
 };
 
 use crate::{
-    gfx::{Font, Gfx, Qr, zec},
+    gfx::{Font, Gfx, Qr, num, zec},
     ui::{Key, PROGRESS, Pin, PinPad, Shell, Worker},
 };
 
@@ -65,6 +67,8 @@ const SNARKS_PATH: &CStr = c"/ext/apps_data/zflip/snarks.bin";
 const SNARK_RECORD: usize = 169;
 const SNARKS: u16 = 10_000;
 const HOME: [&str; 3] = ["Receive", "Collections", "Settings"];
+/// With a Wi-Fi board answering, the network gets its own entry.
+const HOME_WIFI: [&str; 4] = ["Receive", "Network", "Collections", "Settings"];
 /// NFT collections viewable on the Flipper (one so far).
 const COLLECTIONS: [&str; 1] = ["zkSNARKs"];
 const SETTINGS: [&str; 6] = ["Recovery words", "Viewing key", "Change PIN", "Network", "Lock", "Wipe wallet"];
@@ -85,6 +89,18 @@ enum Screen {
     Review(u8),
     Done { ok: bool },
     Message(&'static str),
+    /// Where the last signed transaction stands (with the Wi-Fi board).
+    Track,
+    /// The network and the ZEC price (with the Wi-Fi board).
+    Network,
+}
+
+/// The last signed transaction, followed through the Wi-Fi board.
+struct Track {
+    txid: [u8; 32],
+    tx: wifi::Tx,
+    /// Tick of the last question to the board.
+    asked: u32,
 }
 
 struct State {
@@ -109,13 +125,18 @@ struct State {
     playing: bool,
     fast: bool,
     last_step: u32,
+    /// The Wi-Fi board's network, `None` when no board answers.
+    wifi: Option<wifi::Net>,
+    track: Option<Track>,
+    price: Option<wifi::Price>,
+    network: Option<wifi::NetInfo>,
 }
 
 enum Job {
     Opened(Result<(vault::Meta, Arc<SigningKey>, Arc<orchard::keys::IncomingViewingKey>), vault::Error>),
     Address(u32, String, Option<Qr>),
     Reviewed(Result<Review, sign::Error>),
-    Signed(Result<Vec<SpendSignature>, sign::Error>),
+    Signed(Result<Vec<SpendSignature>, sign::Error>, Option<[u8; 32]>),
 }
 
 struct Session {
@@ -123,6 +144,13 @@ struct Session {
     decoder: Decoder,
     /// The protocol itself, shared with every ZFirm device.
     core: session::Session,
+    board: Option<wifi::Board>,
+    /// Ticks: until when to wait for a board's first answer, and its last answer.
+    board_probe_until: u32,
+    board_heard: u32,
+    board_hello: u32,
+    /// Tick of the last price and network questions.
+    board_market: u32,
 }
 
 /// What the shared session needs to know about this Flipper's wallet.
@@ -166,16 +194,30 @@ fn main(_args: Option<&CStr>) -> i32 {
             playing: true,
             fast: false,
             last_step: 0,
+            wifi: None,
+            track: None,
+            price: None,
+            network: None,
         },
         draw,
     );
-    let mut session = Session { link: None, decoder: Decoder::new(), core: session::Session::new() };
+    let mut session = Session {
+        link: None,
+        decoder: Decoder::new(),
+        core: session::Session::new(),
+        board: None,
+        board_probe_until: 0,
+        board_heard: 0,
+        board_hello: 0,
+        board_market: 0,
+    };
     loop {
         let key = shell.next_key();
         if let Some(job) = worker.poll() {
             finish(&shell, &mut worker, &mut session, job);
         }
         poll_link(&shell, &mut worker, &mut session);
+        poll_board(&shell, &mut session);
         {
             let mut s = shell.state.lock();
             s.frame += 1;
@@ -197,7 +239,91 @@ fn main(_args: Option<&CStr>) -> i32 {
     }
     worker.wait();
     session.link = None;
+    session.board = None;
     0
+}
+
+/// How long a Wi-Fi board gets to answer after power-up (it boots in about a second).
+const BOARD_PROBE_MS: u32 = 4000;
+/// A board silent this long is gone.
+const BOARD_LOST_MS: u32 = 15_000;
+/// How often to ask where a transaction stands.
+const TRACK_EVERY_MS: u32 = 4000;
+/// Confirmations after which a transaction is settled (and no longer followed).
+const SETTLED: u32 = 10;
+/// How often to refresh the price and the network's state (every block or so).
+const MARKET_EVERY_MS: u32 = 60_000;
+
+/// Powers the GPIO header and looks for a Wi-Fi board for a few seconds; without
+/// one, ZFlip carries on exactly as before.
+fn probe_board(session: &mut Session) {
+    if session.board.is_none() {
+        session.board = wifi::Board::open();
+        session.board_probe_until = unsafe { sys::furi_get_tick() }.wrapping_add(BOARD_PROBE_MS);
+        session.board_hello = 0;
+    }
+}
+
+fn poll_board(shell: &Shell<State>, session: &mut Session) {
+    let Some(board) = session.board.as_mut() else { return };
+    let now = unsafe { sys::furi_get_tick() };
+    let mut s = shell.state.lock();
+    while let Some(reply) = board.poll() {
+        session.board_heard = now;
+        match reply {
+            wifi::Reply::Hello(net) => {
+                // A board without a network gets the one saved on the SD card.
+                if net == wifi::Net::NoWifi && s.wifi.is_none() {
+                    board.send_wifi();
+                }
+                s.wifi = Some(net);
+            }
+            wifi::Reply::Tx(tx) => {
+                if let Some(t) = s.track.as_mut() {
+                    t.tx = tx;
+                }
+            }
+            wifi::Reply::WifiSaved => s.wifi = Some(wifi::Net::Connecting),
+            wifi::Reply::Price(p) => s.price = Some(p),
+            wifi::Reply::Net(n) => s.network = Some(n),
+        }
+    }
+    let present = s.wifi.is_some();
+    // Still probing: hello twice a second. Found: every five seconds, to follow its Wi-Fi.
+    let every = if present { 5000 } else { 500 };
+    if now.wrapping_sub(session.board_hello) >= every {
+        session.board_hello = now;
+        board.hello();
+    }
+    let online = s.wifi == Some(wifi::Net::Online);
+    let stale = s.price.is_none() || now.wrapping_sub(session.board_market) >= MARKET_EVERY_MS;
+    // Fresh on the Network screen; otherwise once a minute (the price shows in reviews).
+    let wanted = stale || (s.screen == Screen::Network && now.wrapping_sub(session.board_market) >= TRACK_EVERY_MS * 3);
+    if online && wanted && now.wrapping_sub(session.board_market) >= 2000 {
+        session.board_market = now;
+        board.ask_price();
+        board.ask_network();
+    }
+    if let Some(t) = s.track.as_mut() {
+        if present && !settled(t) && now.wrapping_sub(t.asked) >= TRACK_EVERY_MS {
+            t.asked = now;
+            board.ask(&t.txid);
+        }
+    }
+    let gone = if present {
+        now.wrapping_sub(session.board_heard) >= BOARD_LOST_MS
+    } else {
+        (now.wrapping_sub(session.board_probe_until) as i32) >= 0
+    };
+    if gone {
+        // No board (or it was unplugged): power the header off again.
+        if s.wifi.is_some() && matches!(s.screen, Screen::Track | Screen::Network) {
+            s.screen = Screen::Home(0);
+        }
+        s.wifi = None;
+        drop(s);
+        session.board = None;
+    }
 }
 
 /// The index after the last one handed out: #0 for a new wallet.
@@ -275,7 +401,10 @@ fn apply(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session, 
     match step.work {
         Some(Work::Review(req)) => worker.spawn(move || Job::Reviewed(stable::with(|| sign::review(&req, &*account)))),
         Some(Work::Sign(req)) => {
-            worker.spawn(move || Job::Signed(stable::with(|| sign::sign_reviewed(&req, &*account, HwRng))))
+            worker.spawn(move || {
+                let sigs = stable::with(|| sign::sign_reviewed(&req, &*account, HwRng));
+                Job::Signed(sigs, sign::txid(&req).ok())
+            })
         }
         None => {}
     }
@@ -316,6 +445,7 @@ fn finish(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session,
             }
             // Bluetooth stays on while the app is open.
             session.link = ble::Link::start();
+            probe_board(session);
             if session.link.is_none() {
                 shell.state.lock().screen = Screen::Message("Bluetooth is off:\nturn it on in Settings");
             }
@@ -350,9 +480,18 @@ fn finish(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session,
             let step = session.core.reviewed(result);
             apply(shell, worker, session, step);
         }
-        Job::Signed(result) => {
+        Job::Signed(result, txid) => {
+            let signed = result.is_ok();
             let step = session.core.signed(result);
             apply(shell, worker, session, step);
+            let mut s = shell.state.lock();
+            if let (true, Some(txid)) = (signed, txid) {
+                // Followed through the Wi-Fi board, if one is here now or later.
+                s.track = Some(Track { txid, tx: wifi::Tx::Asking, asked: 0 });
+                if s.wifi.is_some() {
+                    s.screen = Screen::Track;
+                }
+            }
         }
     }
 }
@@ -383,21 +522,26 @@ fn input(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session, 
             }
         },
         Screen::Busy(_) => {}
-        Screen::Home(sel) => match k {
-            Key::Up => s.screen = Screen::Home((sel + 2) % 3),
-            Key::Down => s.screen = Screen::Home((sel + 1) % 3),
-            Key::Ok if sel == 0 => {
-                if s.address.is_some() {
-                    s.screen = Screen::Receive { text: false };
-                } else {
-                    s.screen = Screen::Busy("Forging address");
-                }
+        Screen::Home(sel) => {
+            let items = home_items(&s);
+            let n = items.len() as u8;
+            let sel = sel.min(n - 1);
+            match k {
+                Key::Up => s.screen = Screen::Home((sel + n - 1) % n),
+                Key::Down => s.screen = Screen::Home((sel + 1) % n),
+                Key::Ok => match items[sel as usize] {
+                    "Receive" if s.address.is_some() => s.screen = Screen::Receive { text: false },
+                    "Receive" => s.screen = Screen::Busy("Forging address"),
+                    // The last transaction first while it is still being followed.
+                    "Network" if s.track.as_ref().is_some_and(|t| !settled(t)) => s.screen = Screen::Track,
+                    "Network" => s.screen = Screen::Network,
+                    "Collections" => s.screen = Screen::Collections(0),
+                    _ => s.screen = Screen::Settings(0),
+                },
+                Key::Back => return false,
+                _ => {}
             }
-            Key::Ok if sel == 1 => s.screen = Screen::Collections(0),
-            Key::Ok => s.screen = Screen::Settings(0),
-            Key::Back => return false,
-            _ => {}
-        },
+        }
         Screen::Collections(_) => match k {
             Key::Ok => {
                 let id = s.snark;
@@ -409,7 +553,7 @@ fn input(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session, 
                     Screen::Message("Copy snarks.bin to\napps_data/zflip")
                 };
             }
-            Key::Back => s.screen = Screen::Home(1),
+            Key::Back => s.screen = home_at(&s, "Collections"),
             _ => {}
         },
         Screen::Gallery => {
@@ -464,7 +608,7 @@ fn input(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session, 
                     s.screen = Screen::Pin;
                 }
                 Key::Ok => s.screen = Screen::Wipe,
-                Key::Back => s.screen = Screen::Home(2),
+                Key::Back => s.screen = home_at(&s, "Settings"),
                 _ => {}
             }
         }
@@ -509,6 +653,22 @@ fn input(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session, 
                 s.screen = s.resume;
             }
         }
+        Screen::Track => match k {
+            Key::Back => s.screen = home_at(&s, "Network"),
+            Key::Right => s.screen = Screen::Network,
+            // Ask again now.
+            Key::Ok => {
+                if let Some(t) = s.track.as_mut() {
+                    t.asked = 0;
+                }
+            }
+            _ => {}
+        },
+        Screen::Network => match k {
+            Key::Back => s.screen = home_at(&s, "Network"),
+            Key::Left if s.track.is_some() => s.screen = Screen::Track,
+            _ => {}
+        },
         Screen::Message(_) => {
             if matches!(k, Key::Ok | Key::Back) {
                 if s.account.is_some() {
@@ -628,8 +788,12 @@ fn draw(g: &Gfx, s: &State) {
             g.title(if s.meta.map(|m| m.network) == Some(Network::Test) { "ZFlip testnet" } else { "ZFlip" });
             link_badge(g, s);
             g.shield(18, 37, 1000, 0);
-            menu(g, &HOME, sel, 40, 23, 12);
+            let items = home_items(s);
+            let sel = sel.min(items.len() as u8 - 1);
+            // Four entries (with the Wi-Fi board) sit closer together.
+            if items.len() > 3 { menu(g, items, sel, 40, 21, 10) } else { menu(g, items, sel, 40, 23, 12) }
             g.font(Font::Small);
+            wifi_badge(g, s);
             g.text(
                 38,
                 61,
@@ -751,6 +915,10 @@ fn draw(g: &Gfx, s: &State) {
                 g.line(2, 37, 126, 37);
                 g.text(2, 47, "Total");
                 g.right(126, 47, &zec(r.total_out()));
+                // In dollars, from the Wi-Fi board's price: a guide, never part of what is signed.
+                if let Some(p) = s.price {
+                    g.right(126, 56, &["~ ", &usd(r.total_out() as u128 * p.usd_cents as u128 / zfirm_core::COIN as u128)].concat());
+                }
                 g.hints("Back: refuse", "Hold OK: sign");
             }
         }
@@ -766,6 +934,176 @@ fn draw(g: &Gfx, s: &State) {
             g.hints("", "OK");
         }
         Screen::Message(text) => ui::draw_message(g, text),
+        Screen::Track => draw_track(g, s),
+        Screen::Network => draw_network(g, s),
+    }
+}
+
+/// "$1270.99" from cents.
+fn usd(cents: u128) -> String {
+    let c = num((cents % 100) as u64);
+    [ "$", &num((cents / 100) as u64), ".", if c.len() < 2 { "0" } else { "" }, &c ].concat()
+}
+
+/// "+3.77%" from basis points.
+fn percent(bp: i32) -> String {
+    let (sign, n) = if bp < 0 { ("-", (-bp) as u64) } else { ("+", bp as u64) };
+    let c = num(n % 100);
+    [sign, &num(n / 100), ".", if c.len() < 2 { "0" } else { "" }, &c, "%"].concat()
+}
+
+/// The network and the ZEC price, as ZScan sees them.
+fn draw_network(g: &Gfx, s: &State) {
+    g.title("Zcash network");
+    wifi_badge(g, s);
+    g.font(Font::Small);
+    let Some(n) = s.network else {
+        g.center(36, if s.wifi == Some(wifi::Net::Online) { "Asking ZScan..." } else { "Wi-Fi board offline" });
+        g.hints("Back", "");
+        return;
+    };
+    g.text(2, 22, "Block");
+    g.right(126, 22, &num(n.height as u64));
+    if let Some(p) = s.price {
+        g.text(2, 32, "ZEC");
+        g.right(126, 32, &[usd(p.usd_cents as u128).as_str(), "  ", &percent(p.change)].concat());
+    }
+    g.text(2, 42, "Transactions 24 h");
+    g.right(126, 42, &num(n.txs_24h as u64));
+    g.text(2, 52, "Shielded");
+    g.right(126, 52, &[num(n.shielded as u64 / 10).as_str(), ".", &num(n.shielded as u64 % 10), "%"].concat());
+    g.hints("Back", if s.track.is_some() { "< Transaction" } else { "" });
+}
+
+fn home_items(s: &State) -> &'static [&'static str] {
+    if s.wifi.is_some() { &HOME_WIFI } else { &HOME }
+}
+
+/// The home screen with `label` selected (where Back from that entry lands).
+fn home_at(s: &State, label: &str) -> Screen {
+    Screen::Home(home_items(s).iter().position(|l| *l == label).unwrap_or(0) as u8)
+}
+
+fn settled(t: &Track) -> bool {
+    matches!(t.tx, wifi::Tx::Mined { confirmations, .. } if confirmations >= SETTLED)
+}
+
+/// The Wi-Fi board, as bars left of the phone badge: filled when online.
+fn wifi_badge(g: &Gfx, s: &State) {
+    let Some(net) = s.wifi else { return };
+    g.white();
+    for i in 0..3 {
+        let (x, h) = (100 + i * 3, 3 + i * 2);
+        if net == wifi::Net::Online {
+            g.fill(x, 9 - h, 2, h);
+        } else {
+            g.dot(x, 8);
+        }
+    }
+    g.black();
+}
+
+/// Where the last signed transaction stands: an hourglass while it waits, a block
+/// once mined, and its confirmations.
+fn draw_track(g: &Gfx, s: &State) {
+    g.title("Transaction");
+    wifi_badge(g, s);
+    let Some(t) = &s.track else { return };
+    let (lines, mined): ([&str; 2], Option<(u32, u32)>) = match (s.wifi, t.tx) {
+        (Some(net), _) if net != wifi::Net::Online => (
+            [
+                "Wi-Fi board",
+                match net {
+                    wifi::Net::NoWifi => "needs wifi.txt",
+                    wifi::Net::Failed => "cannot join Wi-Fi",
+                    _ => "joining Wi-Fi...",
+                },
+            ],
+            None,
+        ),
+        (_, wifi::Tx::Asking) => (["Asking ZScan", ""], None),
+        (_, wifi::Tx::Unknown) => (["Not sent yet:", "phone sends it"], None),
+        (_, wifi::Tx::Mempool) => (["In the mempool", "waiting for a block"], None),
+        (_, wifi::Tx::Mined { height, confirmations }) => (["In block", ""], Some((height, confirmations))),
+        (_, wifi::Tx::Offline) => (["Wi-Fi board", "offline"], None),
+        (_, wifi::Tx::Error) => (["ZScan did not", "answer: retrying"], None),
+    };
+    g.font(Font::Small);
+    g.text(36, 22, lines[0]);
+    match mined {
+        Some((height, confirmations)) => {
+            block_icon(g, 6, 20, confirmations >= SETTLED);
+            g.font(Font::Big);
+            g.text(36, 35, &gfx::num(height as u64));
+            g.font(Font::Small);
+            let shown = confirmations.min(SETTLED);
+            let label = [&gfx::num(shown as u64), "/", &gfx::num(SETTLED as u64), " confirmations"].concat();
+            g.text(36, 46, &label);
+            g.frame(36, 49, 88, 5);
+            g.fill(37, 50, (86 * shown / SETTLED) as i32, 3);
+        }
+        None => {
+            hourglass(g, 8, 17, s.frame);
+            g.text(36, 33, lines[1]);
+        }
+    }
+    // The txid's start, to match it in an explorer.
+    let mut short = String::from("tx ");
+    for b in &t.txid[..4] {
+        short.push(char::from(b"0123456789abcdef"[(b >> 4) as usize]));
+        short.push(char::from(b"0123456789abcdef"[(b & 15) as usize]));
+    }
+    g.hints("Back", &short);
+}
+
+/// An hourglass whose sand runs down, then turns over.
+fn hourglass(g: &Gfx, x: i32, y: i32, frame: u32) {
+    const H: i32 = 16; // each bulb's height
+    const W: i32 = 9; // half the width at the rim
+    let cx = x + W;
+    let phase = (frame % 64) as i32; // ~2.5 s per run
+    let fallen = phase * H / 64;
+    g.line(x, y, x + 2 * W, y);
+    g.line(x, y + 2 * H, x + 2 * W, y + 2 * H);
+    g.line(x + 1, y + 1, cx, y + H);
+    g.line(x + 2 * W - 1, y + 1, cx, y + H);
+    g.line(cx, y + H, x + 1, y + 2 * H - 1);
+    g.line(cx, y + H, x + 2 * W - 1, y + 2 * H - 1);
+    for r in 0..H - 1 {
+        // Top bulb: sand below its sinking surface.
+        if r >= fallen + 1 {
+            let w = (H - r) * W / H - 1;
+            if w > 0 {
+                g.line(cx - w, y + r + 1, cx + w, y + r + 1);
+            }
+        }
+        // Bottom bulb: the pile grows from the floor.
+        if r >= H - 1 - fallen {
+            let w = r * W / H - 1;
+            if w > 0 {
+                g.line(cx - w, y + H + r, cx + w, y + H + r);
+            }
+        }
+    }
+    // The falling grains.
+    if fallen < H - 1 {
+        for d in (((frame % 2) as i32)..(2 * H - 2 - fallen - H)).step_by(2) {
+            g.dot(cx, y + H + 1 + d);
+        }
+    }
+}
+
+/// A block, with a check once the transaction is settled.
+fn block_icon(g: &Gfx, x: i32, y: i32, settled: bool) {
+    g.frame(x, y + 6, 18, 18);
+    g.line(x, y + 6, x + 6, y);
+    g.line(x + 18, y + 6, x + 23, y);
+    g.line(x + 17, y + 23, x + 23, y + 17);
+    g.line(x + 6, y, x + 23, y);
+    g.line(x + 23, y, x + 23, y + 17);
+    if settled {
+        g.line(x + 4, y + 15, x + 7, y + 18);
+        g.line(x + 7, y + 18, x + 13, y + 10);
     }
 }
 

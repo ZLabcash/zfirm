@@ -31,14 +31,14 @@ use orchard::{
     Action as OrchardAction, Address, Anchor, Note, ValuePool,
     bundle::{EffectsOnly, Flags, TxVersion, commitments::hash_bundle_txid_empty},
     keys::{FullViewingKey, SpendAuthorizingKey, SpendValidatingKey},
-    note::{ExtractedNoteCommitment, Nullifier, NoteVersion, RandomSeed, Rho, TransmittedNoteCiphertext},
-    note_encryption::{IronwoodDomain, OrchardDomain},
+    note::{ExtractedNoteCommitment, Nullifier, RandomSeed, Rho, TransmittedNoteCiphertext},
+    note_encryption::OrchardDomain,
     primitives::redpallas::{self, SpendAuth},
     value::{NoteValue, ValueCommitTrapdoor, ValueCommitment},
 };
 use pasta_curves::{group::ff::PrimeField, pallas};
 use rand_core::{CryptoRng, RngCore};
-use zcash_note_encryption::{Domain, try_output_recovery_with_pkd_esk};
+use zcash_note_encryption::Domain;
 use crate::{
     Network,
     request::{self, Owner, SignRequest, SpendSignature},
@@ -206,7 +206,7 @@ pub fn review(req: &SignRequest, account: &impl Wallet) -> Result<Review, Error>
             }
             // Dummy outputs carry nothing; every other one must reach its recipient.
             let memo = if action.output_value > 0 {
-                memo_text(&check_ciphertext(action, &note, note_version)?)
+                memo_text(&check_ciphertext(action, &note)?)
             } else {
                 None
             };
@@ -294,39 +294,42 @@ pub fn sign_reviewed<R: RngCore + CryptoRng>(
 }
 
 /// Decrypts the action's output with the key its recipient derives (from the note's
-/// own `esk`, as the sender) and checks it holds exactly `note`: the plaintext, the
-/// ephemeral key and the note commitment. Returns the memo.
-fn check_ciphertext(action: &request::Action, note: &Note, version: NoteVersion) -> Result<[u8; 512], Error> {
-    let output = OrchardAction::from_parts(
-        Option::from(Nullifier::from_bytes(&action.nullifier)).ok_or(Error::Parse)?,
-        redpallas::VerificationKey::try_from(action.rk).map_err(|_| Error::Parse)?,
-        Option::from(ExtractedNoteCommitment::from_bytes(&action.cmx)).ok_or(Error::Parse)?,
-        TransmittedNoteCiphertext {
-            epk_bytes: action.epk,
-            enc_ciphertext: action.enc_ciphertext.as_slice().try_into().map_err(|_| Error::Parse)?,
-            out_ciphertext: action.out_ciphertext,
-        },
-        Option::from(ValueCommitment::from_bytes(&action.cv_net)).ok_or(Error::Parse)?,
-        (),
-    )
-    .map_err(|_| Error::Parse)?;
-    fn recover<D: Domain<Note = Note, Memo = [u8; 512]>>(
-        domain: &D,
-        note: &Note,
-        output: &OrchardAction<()>,
-    ) -> Option<[u8; 512]>
-    where
-        OrchardAction<()>: zcash_note_encryption::ShieldedOutput<D, { zcash_note_encryption::ENC_CIPHERTEXT_SIZE }>,
-    {
-        let esk = D::derive_esk(note)?;
-        let (decrypted, _, memo) = try_output_recovery_with_pkd_esk(domain, D::get_pk_d(note), esk, output)?;
-        (decrypted == *note).then_some(memo)
+/// own `esk`, as the sender) and checks it holds exactly `note`: the ephemeral key
+/// and the plaintext. Returns the memo.
+///
+/// The same check as `try_output_recovery_with_pkd_esk`, minus the note commitment
+/// it recomputes (the review already did) and with one code path for both note
+/// versions (only the plaintext's lead byte differs, and `note` carries it): the
+/// generic route cost the Flipper app ~2 KiB of RAM, which it does not have.
+fn check_ciphertext(action: &request::Action, note: &Note) -> Result<[u8; 512], Error> {
+    use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, KeyInit};
+    use zcash_note_encryption::{EphemeralKeyBytes, NOTE_PLAINTEXT_SIZE};
+
+    let esk = OrchardDomain::derive_esk(note).ok_or(Error::Verification)?;
+    let epk = OrchardDomain::epk_bytes(&OrchardDomain::ka_derive_public(note, &esk));
+    if epk.0 != action.epk {
+        return Err(Error::Verification);
     }
-    match version {
-        NoteVersion::V2 => recover(&OrchardDomain::for_action(&output), note, &output),
-        NoteVersion::V3 => recover(&IronwoodDomain::for_action(&output), note, &output),
+    let secret = OrchardDomain::ka_agree_enc(&esk, &OrchardDomain::get_pk_d(note));
+    let key = OrchardDomain::kdf(secret, &EphemeralKeyBytes(action.epk));
+
+    let enc = action.enc_ciphertext.as_slice();
+    if enc.len() != NOTE_PLAINTEXT_SIZE + 16 {
+        return Err(Error::Parse);
     }
-    .ok_or(Error::Verification)
+    let mut plaintext = [0u8; NOTE_PLAINTEXT_SIZE];
+    plaintext.copy_from_slice(&enc[..NOTE_PLAINTEXT_SIZE]);
+    ChaCha20Poly1305::new(key.as_ref().into())
+        .decrypt_in_place_detached(&[0u8; 12].into(), &[], &mut plaintext, enc[NOTE_PLAINTEXT_SIZE..].into())
+        .map_err(|_| Error::Verification)?;
+    // Lead byte, diversifier, value and rseed: the note's own (the memo is not ours to know).
+    let expected = OrchardDomain::note_plaintext_bytes(note, &[0u8; 512]);
+    if plaintext[..52] != expected.0[..52] {
+        return Err(Error::Verification);
+    }
+    let mut memo = [0u8; 512];
+    memo.copy_from_slice(&plaintext[52..]);
+    Ok(memo)
 }
 
 /// A memo as text (ZIP 302): `None` if empty, a marker if it is not text.
@@ -375,6 +378,14 @@ fn display_address(account: &impl Wallet, typed: &str, recipient: &Address) -> R
     } else {
         Err(Error::AddressMismatch)
     }
+}
+
+/// The transaction's id, as explorers show it. A request has no transparent part, so
+/// its signature digest is the txid digest (ZIP 244), shown byte-reversed.
+pub fn txid(req: &SignRequest) -> Result<[u8; 32], Error> {
+    let mut id = shielded_sighash(req)?;
+    id.reverse();
+    Ok(id)
 }
 
 /// The ZIP 244 signature digest for shielded spends. Without transparent inputs it
