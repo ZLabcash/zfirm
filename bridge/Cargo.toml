@@ -15,9 +15,11 @@ pczt = { version = "0.9.3", default-features = false, features = ["std", "orchar
 zcash_address = "0.13"
 zcash_keys = { version = "0.16", features = ["orchard"] }
 zcash_protocol = "0.10"
-zflip-core = { path = "../core" }
+zflip-core = { path = "../core", features = ["english"] }
+zip32 = "0.2"
 
 [dev-dependencies]
+hex = "0.4"
 incrementalmerkletree = "0.8"
 orchard = { version = "0.15", features = ["circuit"] }
 pczt = { version = "0.9.3", features = ["io-finalizer", "prover", "signer", "tx-extractor", "zcp-builder"] }

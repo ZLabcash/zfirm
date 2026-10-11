@@ -485,3 +485,18 @@ fn multisend_reviews_every_payment_and_signs_once() {
         TransactionExtractor::new(proven).extract().unwrap();
     }
 }
+
+#[test]
+fn recovery_phrases_match_bip39_and_zip32() {
+    // BIP 39 reference vector, then a fresh phrase round trip.
+    let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    let seed = zflip_bridge::mnemonic_seed(phrase).unwrap();
+    assert_eq!(hex::encode(seed), "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4");
+    assert!(zflip_bridge::mnemonic_seed(&phrase.replace("about", "abandon")).is_err());
+    assert!(zflip_bridge::mnemonic_seed("  Abandon ABANDON abandon abandon abandon abandon abandon abandon abandon abandon abandon About ").is_ok());
+    let fresh = zflip_bridge::mnemonic_new(&[42u8; 32]);
+    assert_eq!(fresh.split(' ').count(), 24);
+    let seed = zflip_bridge::mnemonic_seed(&fresh).unwrap();
+    let fp = zflip_bridge::seed_fingerprint(&seed).unwrap();
+    assert_eq!(fp, zip32::fingerprint::SeedFingerprint::from_seed(&seed).unwrap().to_bytes());
+}
