@@ -99,6 +99,43 @@ pub unsafe extern "C" fn zflip_address(ufvk: *const c_char, index: u32, out: *mu
     finish(result, out)
 }
 
+/// 32 bytes of entropy → 24 words (UTF-8, single spaces).
+///
+/// # Safety
+/// `entropy` must point to 32 readable bytes and `out` be writable for one `ZflipBuffer`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zflip_mnemonic_new(entropy: *const u8, out: *mut ZflipBuffer) -> i32 {
+    let bytes = unsafe { slice(entropy, 32) };
+    let result = <[u8; 32]>::try_from(bytes)
+        .map_err(|_| crate::Error::Mnemonic)
+        .map(|e| crate::mnemonic_new(&e).into_bytes());
+    finish(result, out)
+}
+
+/// Words → 64-byte BIP 39 seed (errors if a word or the checksum is wrong).
+///
+/// # Safety
+/// `phrase` must be a NUL-terminated string and `out` writable for one `ZflipBuffer`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zflip_mnemonic_seed(phrase: *const c_char, out: *mut ZflipBuffer) -> i32 {
+    let result = unsafe { CStr::from_ptr(phrase) }
+        .to_str()
+        .map_err(|_| crate::Error::Mnemonic)
+        .and_then(crate::mnemonic_seed)
+        .map(|s| s.to_vec());
+    finish(result, out)
+}
+
+/// Seed → its 32-byte ZIP 32 fingerprint.
+///
+/// # Safety
+/// `seed` must point to `seed_len` readable bytes and `out` be writable for one `ZflipBuffer`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zflip_seed_fingerprint(seed: *const u8, seed_len: usize, out: *mut ZflipBuffer) -> i32 {
+    let seed = unsafe { slice(seed, seed_len) };
+    finish(crate::seed_fingerprint(seed).map(|f| f.to_vec()), out)
+}
+
 /// Releases a buffer returned by this library.
 ///
 /// # Safety

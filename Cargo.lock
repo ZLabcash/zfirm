@@ -1958,6 +1958,7 @@ dependencies = [
 name = "zflip-bridge"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "incrementalmerkletree",
  "orchard",
  "pasta_curves",

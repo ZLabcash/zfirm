@@ -23,6 +23,31 @@ use zflip_core::request::{self, Owner, SignRequest, SpendSignature};
 
 pub mod ffi;
 
+// ---- Recovery phrases, for wallets whose seed lives on the phone ----
+
+/// 24 words from 32 bytes of entropy (the caller's system RNG).
+pub fn mnemonic_new(entropy: &[u8; 32]) -> String {
+    let list = zflip_core::mnemonic::Packed::new(zflip_core::mnemonic::ENGLISH).expect("embedded list");
+    let indices = zflip_core::mnemonic::indices_from_entropy(entropy);
+    zflip_core::mnemonic::sentence(&indices, &list).expect("valid indices")
+}
+
+/// The BIP 39 seed of a phrase (no passphrase), after checking its words and checksum.
+/// The phrase is normalised: lowercase, single spaces.
+pub fn mnemonic_seed(phrase: &str) -> Result<[u8; 64], Error> {
+    let list = zflip_core::mnemonic::Packed::new(zflip_core::mnemonic::ENGLISH).expect("embedded list");
+    let lower = phrase.to_lowercase();
+    let indices = zflip_core::mnemonic::parse(&lower, &list).map_err(|_| Error::Mnemonic)?;
+    zflip_core::mnemonic::validate(&indices).map_err(|_| Error::Mnemonic)?;
+    let normal = zflip_core::mnemonic::sentence(&indices, &list).ok_or(Error::Mnemonic)?;
+    Ok(zflip_core::mnemonic::to_seed(&normal, "", |_| {}))
+}
+
+/// ZIP 32 seed fingerprint (what hardware wallets and PCZTs identify a seed by).
+pub fn seed_fingerprint(seed: &[u8]) -> Result<[u8; 32], Error> {
+    zip32::fingerprint::SeedFingerprint::from_seed(seed).map(|f| f.to_bytes()).ok_or(Error::Mnemonic)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     Pczt(String),
@@ -30,6 +55,8 @@ pub enum Error {
     /// ZFlip only signs shielded Orchard/Ironwood transactions.
     Unsupported(&'static str),
     Signature(String),
+    /// Not 24 (or 12…) valid BIP 39 words with a matching checksum.
+    Mnemonic,
 }
 
 impl std::fmt::Display for Error {
@@ -39,6 +66,7 @@ impl std::fmt::Display for Error {
             Error::Ufvk => write!(f, "invalid viewing key"),
             Error::Unsupported(what) => write!(f, "unsupported: {what}"),
             Error::Signature(e) => write!(f, "signature rejected: {e}"),
+            Error::Mnemonic => write!(f, "these words aren't a valid recovery phrase"),
         }
     }
 }
