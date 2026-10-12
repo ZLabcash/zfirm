@@ -1,12 +1,14 @@
-//! ZFirm Wi-Fi board: firmware for the Flipper Zero Wi-Fi devboard (ESP32-S2).
+//! ZFirm Wi-Fi board: firmware for the Flipper Zero Wi-Fi devboard (ESP32-S2), or any
+//! ESP32 with Wi-Fi (ESP32, S2, S3, C3, C6) wired to the Flipper's header.
 //!
 //! The board joins a Wi-Fi network and asks the ZScan API where a transaction
 //! signed by ZFlip stands: in the mempool, or mined and how deep. It never holds a
 //! key: all it gets from the Flipper is a transaction id (public once broadcast)
 //! and the Wi-Fi network to join.
 //!
-//! The Flipper talks to it over UART0 (GPIO 43/44, the header's pins 13/14) at
-//! 115200 baud, one line per message, `\n`-terminated:
+//! The Flipper talks to it over UART0 (on the devboard GPIO 43/44, the header's pins
+//! 13/14; see `PINS` for the other chips) at 115200 baud, one line per message,
+//! `\n`-terminated:
 //!
 //! | Flipper sends          | Board answers                                        |
 //! |------------------------|------------------------------------------------------|
@@ -35,7 +37,12 @@ use anyhow::Result;
 use embedded_svc::http::client::Client;
 use esp_idf_svc::{
     eventloop::EspSystemEventLoop,
-    hal::{gpio::AnyIOPin, peripherals::Peripherals, uart, units::Hertz},
+    hal::{
+        gpio::{AnyIOPin, PinId},
+        peripherals::Peripherals,
+        uart,
+        units::Hertz,
+    },
     http::client::{Configuration as HttpConfig, EspHttpConnection},
     nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault},
     wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi},
@@ -43,6 +50,22 @@ use esp_idf_svc::{
 use log::{info, warn};
 
 const API: &str = "https://api.zscan.cash/v1";
+
+/// (TX, RX) to the Flipper: UART0's own pins on each chip, unless the board is wired
+/// otherwise (build with ZFIRM_UART_TX / ZFIRM_UART_RX set).
+const PINS: (PinId, PinId) = if cfg!(any(esp32s2, esp32s3)) {
+    (43, 44)
+} else if cfg!(esp32c3) {
+    (21, 20)
+} else if cfg!(esp32c6) {
+    (16, 17)
+} else {
+    (1, 3) // ESP32
+};
+
+fn pin(set: Option<&str>, default: PinId) -> PinId {
+    set.and_then(|v| v.parse().ok()).unwrap_or(default)
+}
 const VERSION: u8 = 1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -90,10 +113,13 @@ fn run() -> Result<()> {
     let nvs = EspNvs::new(partition.clone(), "zflip", true)?;
 
     let config = uart::config::Config::default().baudrate(Hertz(115_200));
+    let (tx, rx) = (pin(option_env!("ZFIRM_UART_TX"), PINS.0), pin(option_env!("ZFIRM_UART_RX"), PINS.1));
+    info!("Flipper link on GPIO {tx} (TX) / {rx} (RX)");
+    // SAFETY: these two pins are used for nothing else.
     let link = uart::UartDriver::new(
         p.uart0,
-        p.pins.gpio43,
-        p.pins.gpio44,
+        unsafe { AnyIOPin::steal(tx) },
+        unsafe { AnyIOPin::steal(rx) },
         Option::<AnyIOPin>::None,
         Option::<AnyIOPin>::None,
         &config,

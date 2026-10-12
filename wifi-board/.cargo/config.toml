@@ -1,14 +1,31 @@
+# Build with ./build.sh <chip>: it sets MCU and the target below.
 [build]
 target = "xtensa-esp32s2-espidf"
 
+[target.xtensa-esp32-espidf]
+linker = "ldproxy"
+rustflags = ["--cfg", "espidf_time64"]
+
 [target.xtensa-esp32s2-espidf]
 linker = "ldproxy"
-runner = "espflash flash --monitor"
+rustflags = ["--cfg", "espidf_time64"]
+
+[target.xtensa-esp32s3-espidf]
+linker = "ldproxy"
+rustflags = ["--cfg", "espidf_time64"]
+
+[target.riscv32imc-esp-espidf]
+linker = "ldproxy"
+rustflags = ["--cfg", "espidf_time64"]
+
+[target.riscv32imac-esp-espidf]
+linker = "ldproxy"
 rustflags = ["--cfg", "espidf_time64"]
 
 [unstable]
 build-std = ["std", "panic_abort"]
 
 [env]
+# The default chip (the Flipper devboard); ./build.sh sets another.
 MCU = "esp32s2"
 ESP_IDF_VERSION = "v5.4.2"

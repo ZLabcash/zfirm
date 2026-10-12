@@ -1,0 +1,3 @@
+# UART0 is the Flipper link and the ESP32 has no USB of its own: no log (the boot ROM
+# still prints a few lines at start, which the Flipper ignores).
+CONFIG_ESP_CONSOLE_NONE=y

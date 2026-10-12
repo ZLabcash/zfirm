@@ -1,0 +1,2 @@
+# UART0 is the Flipper link: the log goes to the chip's own USB port (USB Serial/JTAG).
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

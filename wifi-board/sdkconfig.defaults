@@ -1,11 +1,9 @@
-# UART0 (GPIO 43/44) is wired to the Flipper's GPIO header: logs go to the board's
-# own USB port instead, so the Flipper only ever sees our replies.
-CONFIG_ESP_CONSOLE_USB_CDC=y
+# Common to every chip; sdkconfig.defaults.<chip> adds where the log goes.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 # HTTPS: verify api.zscan.cash against the common CA bundle.
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_CMN=y
 CONFIG_ESP_HTTP_CLIENT_ENABLE_HTTPS=y
-# The devboard's ESP32-S2-WROVER has 4 MB of flash; the app (with TLS) needs more
-# than the default 1 MB partition (see partitions.csv).
+# 4 MB of flash at least (the devboard's ESP32-S2-WROVER has 4); the app (with TLS)
+# needs more than the default 1 MB partition (see partitions.csv).
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
