@@ -79,9 +79,13 @@ enum Screen {
     Review(u8),
     Done { ok: bool },
     Message(&'static str),
-    /// Where the last signed transaction stands (with the Wi-Fi board).
+    /// With the Wi-Fi board: Activity or Stats.
+    Chain(u8),
+    /// The last signed transactions and where each stands.
+    Activity(u8),
+    /// One of them in detail (`State::shown`).
     Track,
-    /// The network and the ZEC price (with the Wi-Fi board).
+    /// The network and the ZEC price.
     Network,
     /// "A Wi-Fi board is plugged in: let it go online?"
     WifiPrompt,
@@ -89,13 +93,26 @@ enum Screen {
     ViewKey { text: bool, line: u8 },
 }
 
-/// The last signed transaction, followed through the Wi-Fi board.
+/// A signed transaction, followed through the Wi-Fi board and kept on the SD card
+/// (so a restart does not lose it).
 struct Track {
     txid: [u8; 32],
+    /// What left the wallet: payments and fee, in zatoshis.
+    amount: u64,
+    /// When it was signed (the Flipper's clock, local time, seconds).
+    signed_at: u32,
     tx: wifi::Tx,
     /// Tick of the last question to the board.
     asked: u32,
 }
+
+/// Today's signed transactions: id, amount, time and last known state. Plain on the
+/// card (like the wallet's receiving index): a reader learns which transactions are
+/// yours, so only today's are kept, and at most `ACTIVITY_MAX`.
+const ACTIVITY_PATH: &CStr = c"/ext/apps_data/zflip/activity.bin";
+const ACTIVITY_MAX: usize = 10;
+const ACTIVITY_RECORD: usize = 32 + 8 + 4 + 1 + 4 + 4;
+const CHAIN: [&str; 2] = ["Activity", "Stats"];
 
 struct State {
     screen: Screen,
@@ -115,7 +132,10 @@ struct State {
     ivk: Option<Arc<orchard::keys::IncomingViewingKey>>,
     /// The Wi-Fi board's network, `None` when no board answers.
     wifi: Option<wifi::Net>,
-    track: Option<Track>,
+    /// Today's, newest first, at most `ACTIVITY_MAX`.
+    activity: Vec<Track>,
+    /// The one on the Track screen.
+    shown: usize,
     price: Option<wifi::Price>,
     network: Option<wifi::NetInfo>,
     /// The viewing key and its QR code, while shown.
@@ -137,7 +157,6 @@ struct Session {
     core: session::Session,
     board: Option<wifi::Board>,
     /// Ticks: until when to wait for a board's first answer, and its last answer.
-    board_probe_until: u32,
     board_heard: u32,
     board_hello: u32,
     /// Tick of the last price and network questions.
@@ -148,6 +167,9 @@ struct Session {
     board_allowed: Option<bool>,
     /// The saved network was handed over and not yet acknowledged.
     board_wifi_sent: bool,
+    /// The transaction the board was last asked about (its answer names none), and when.
+    board_asking: Option<usize>,
+    board_asked_at: u32,
 }
 
 /// What the shared session needs to know about this Flipper's wallet.
@@ -177,13 +199,14 @@ fn main(_args: Option<&CStr>) -> i32 {
         decoder: Decoder::new(),
         core: session::Session::new(),
         board: None,
-        board_probe_until: 0,
         board_heard: 0,
         board_hello: 0,
         board_market: 0,
         board_seen: false,
         board_allowed: None,
         board_wifi_sent: false,
+        board_asking: None,
+        board_asked_at: 0,
     };
     loop {
         let key = shell.next_key();
@@ -224,15 +247,14 @@ fn new_state() -> State {
         address: None,
         ivk: None,
         wifi: None,
-        track: None,
+        activity: Vec::new(),
+        shown: 0,
         price: None,
         network: None,
         ufvk: None,
     }
 }
 
-/// How long a Wi-Fi board gets to answer after power-up (it boots in about a second).
-const BOARD_PROBE_MS: u32 = 4000;
 /// A board silent this long is gone.
 const BOARD_LOST_MS: u32 = 15_000;
 /// How often to ask where a transaction stands.
@@ -242,14 +264,13 @@ const SETTLED: u32 = 10;
 /// How often to refresh the price and the network's state (every block or so).
 const MARKET_EVERY_MS: u32 = 60_000;
 
-/// Powers the GPIO header and looks for a Wi-Fi board for a few seconds; without
+/// Powers the GPIO header and listens for a Wi-Fi board while ZFlip is open; without
 /// one, ZFlip carries on exactly as before.
 fn probe_board(session: &mut Session) {
     // Refused once: not again until ZFlip is opened again.
     if session.board.is_none() && session.board_allowed != Some(false) {
         session.board_seen = false;
         session.board = wifi::Board::open();
-        session.board_probe_until = unsafe { sys::furi_get_tick() }.wrapping_add(BOARD_PROBE_MS);
         session.board_hello = 0;
     }
 }
@@ -275,8 +296,12 @@ fn poll_board(shell: &Shell<State>, session: &mut Session) {
                 s.wifi = Some(net);
             }
             wifi::Reply::Tx(tx) => {
-                if let Some(t) = s.track.as_mut() {
+                if let Some(t) = session.board_asking.take().and_then(|i| s.activity.get_mut(i)) {
+                    let changed = t.tx != tx && !matches!(tx, wifi::Tx::Offline | wifi::Tx::Error);
                     t.tx = tx;
+                    if changed {
+                        save_activity(&s.activity);
+                    }
                 }
             }
             wifi::Reply::WifiSaved => {
@@ -300,7 +325,7 @@ fn poll_board(shell: &Shell<State>, session: &mut Session) {
         s = shell.state.lock();
     }
     // Still probing: hello twice a second. Found: every five seconds, to follow its Wi-Fi.
-    let every = if present { 5000 } else { 500 };
+    let every = if present { 5000 } else { 1000 };
     if now.wrapping_sub(session.board_hello) >= every {
         session.board_hello = now;
         board.hello();
@@ -316,31 +341,30 @@ fn poll_board(shell: &Shell<State>, session: &mut Session) {
             board.ask_price();
             board.ask_network();
         }
-        if let Some(t) = s.track.as_mut() {
-            if !settled(t) && now.wrapping_sub(t.asked) >= TRACK_EVERY_MS {
-                t.asked = now;
-                board.ask(&t.txid);
+        // One question at a time (the answer does not say which transaction it is about).
+        let waiting = session.board_asking.is_some() && now.wrapping_sub(session.board_asked_at) < 12_000;
+        if online && !waiting {
+            let next = s.activity.iter().position(|t| !settled(t) && now.wrapping_sub(t.asked) >= TRACK_EVERY_MS);
+            if let Some(i) = next {
+                s.activity[i].asked = now;
+                session.board_asking = Some(i);
+                session.board_asked_at = now;
+                board.ask(&s.activity[i].txid);
             }
         }
     }
-    let gone = if present {
-        now.wrapping_sub(session.board_heard) >= BOARD_LOST_MS
-    } else {
-        (now.wrapping_sub(session.board_probe_until) as i32) >= 0
-    };
-    if gone {
-        // No board (or it was unplugged): power the header off again.
-        if matches!(s.screen, Screen::Track | Screen::Network) {
+    // Silent for a while (unplugged): forget it, but keep listening (and powering the
+    // header) for as long as ZFlip is open, so a board plugged in later is found too.
+    if present && now.wrapping_sub(session.board_heard) >= BOARD_LOST_MS {
+        if matches!(s.screen, Screen::Chain(_) | Screen::Activity(_) | Screen::Track | Screen::Network) {
             s.screen = Screen::Home(0);
         } else if s.screen == Screen::WifiPrompt {
             s.screen = s.resume;
         }
         s.wifi = None;
-        drop(s);
-        session.board = None;
         session.board_seen = false;
         session.board_wifi_sent = false;
-        // A board plugged in again later asks again.
+        // A board plugged in again asks again.
         if session.board_allowed == Some(true) {
             session.board_allowed = None;
         }
@@ -442,6 +466,7 @@ fn finish(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session,
                 let mut s = shell.state.lock();
                 s.meta = Some(meta);
                 s.account = Some(account);
+                s.activity = load_activity();
                 s.ivk = Some(ivk);
                 s.screen = Screen::Home(0);
                 // Each opening hands out a fresh address, prepared in the background.
@@ -495,12 +520,20 @@ fn finish(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session,
         }
         Job::Signed(result, txid) => {
             let signed = result.is_ok();
+            let amount = shell.state.lock().review.as_ref().map_or(0, Review::total_out);
             let step = session.core.signed(result);
             apply(shell, worker, session, step);
             let mut s = shell.state.lock();
             if let (true, Some(txid)) = (signed, txid) {
                 // Followed through the Wi-Fi board, if one is here now or later.
-                s.track = Some(Track { txid, tx: wifi::Tx::Asking, asked: 0 });
+                let signed_at = now_secs();
+                s.activity.retain(|t| same_day(t.signed_at, signed_at));
+                s.activity.insert(0, Track { txid, amount, signed_at, tx: wifi::Tx::Asking, asked: 0 });
+                s.activity.truncate(ACTIVITY_MAX);
+                save_activity(&s.activity);
+                // The board's pending answer was about a transaction now one row down.
+                session.board_asking = None;
+                s.shown = 0;
                 if s.wifi.is_some() {
                     s.screen = Screen::Track;
                 }
@@ -546,8 +579,7 @@ fn input(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session, 
                     "Receive" if s.address.is_some() => s.screen = Screen::Receive { text: false },
                     "Receive" => s.screen = Screen::Busy("Forging address"),
                     // The last transaction first while it is still being followed.
-                    "Blockchain" if s.track.as_ref().is_some_and(|t| !settled(t)) => s.screen = Screen::Track,
-                    "Blockchain" => s.screen = Screen::Network,
+                    "Blockchain" => s.screen = Screen::Chain(0),
                     _ => s.screen = Screen::Settings(0),
                 },
                 Key::Back => return false,
@@ -649,12 +681,32 @@ fn input(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session, 
                 s.screen = s.resume;
             }
         }
-        Screen::Track => match k {
+        Screen::Chain(sel) => match k {
+            Key::Up | Key::Down => s.screen = Screen::Chain(1 - sel),
+            Key::Ok if sel == 0 => s.screen = Screen::Activity(0),
+            Key::Ok => s.screen = Screen::Network,
             Key::Back => s.screen = home_at(&s, "Blockchain"),
-            Key::Right => s.screen = Screen::Network,
+            _ => {}
+        },
+        Screen::Activity(sel) => {
+            let n = s.activity.len() as u8;
+            match k {
+                Key::Up if n > 0 => s.screen = Screen::Activity((sel + n - 1) % n),
+                Key::Down if n > 0 => s.screen = Screen::Activity((sel + 1) % n),
+                Key::Ok if sel < n => {
+                    s.shown = sel as usize;
+                    s.screen = Screen::Track;
+                }
+                Key::Back => s.screen = Screen::Chain(0),
+                _ => {}
+            }
+        }
+        Screen::Track => match k {
+            Key::Back => s.screen = Screen::Activity(s.shown as u8),
             // Ask again now.
             Key::Ok => {
-                if let Some(t) = s.track.as_mut() {
+                let i = s.shown;
+                if let Some(t) = s.activity.get_mut(i) {
                     t.asked = 0;
                 }
             }
@@ -686,11 +738,11 @@ fn input(shell: &Shell<State>, worker: &mut Worker<Job>, session: &mut Session, 
             }
             _ => {}
         },
-        Screen::Network => match k {
-            Key::Back => s.screen = home_at(&s, "Blockchain"),
-            Key::Left if s.track.is_some() => s.screen = Screen::Track,
-            _ => {}
-        },
+        Screen::Network => {
+            if k == Key::Back {
+                s.screen = Screen::Chain(1);
+            }
+        }
         Screen::Message(_) => {
             if matches!(k, Key::Ok | Key::Back) {
                 if s.account.is_some() {
@@ -786,14 +838,14 @@ fn menu(g: &Gfx, items: &[&str], sel: u8, x: i32, y0: i32, step: i32) {
     }
 }
 
-/// The phone link, as a Bluetooth rune in the title bar's right corner: steady once
+/// The phone link, as a Bluetooth rune left of the Wi-Fi fan: steady once
 /// paired, blinking while the phone connects, absent otherwise.
 fn link_badge(g: &Gfx, s: &State) {
     if !s.paired && !(s.connected && (s.frame / 12) % 2 == 0) {
         return;
     }
     g.white();
-    let (x, y) = (121, 1);
+    let (x, y) = (110, 1);
     g.line(x, y, x, y + 8);
     g.line(x, y, x + 2, y + 2);
     g.line(x + 2, y + 2, x - 2, y + 6);
@@ -952,6 +1004,14 @@ fn draw(g: &Gfx, s: &State) {
             g.hints("", "OK");
         }
         Screen::Message(text) => ui::draw_message(g, text),
+        Screen::Chain(sel) => {
+            g.title("Blockchain");
+            wifi_badge(g, s);
+            menu(g, &CHAIN, sel, 6, 26, 14);
+            g.font(Font::Small);
+            g.text(4, 61, "From ZScan, over Wi-Fi");
+        }
+        Screen::Activity(sel) => draw_activity(g, s, sel),
         Screen::Track => draw_track(g, s),
         Screen::Network => draw_network(g, s),
     }
@@ -972,7 +1032,7 @@ fn percent(bp: i32) -> String {
 
 /// The network and the ZEC price, as ZScan sees them.
 fn draw_network(g: &Gfx, s: &State) {
-    g.title("Zcash network");
+    g.title("Stats");
     wifi_badge(g, s);
     g.font(Font::Small);
     let Some(n) = s.network else {
@@ -990,7 +1050,7 @@ fn draw_network(g: &Gfx, s: &State) {
     g.right(126, 42, &num(n.txs_24h as u64));
     g.text(2, 52, "Shielded");
     g.right(126, 52, &[num(n.shielded as u64 / 10).as_str(), ".", &num(n.shielded as u64 % 10), "%"].concat());
-    g.hints("Back", if s.track.is_some() { "< Transaction" } else { "" });
+    g.hints("Back", "");
 }
 
 /// The Wi-Fi network for the Wi-Fi board: its name, then its password, with the
@@ -1023,16 +1083,110 @@ fn home_at(s: &State, label: &str) -> Screen {
     Screen::Home(home_items(s).iter().position(|l| *l == label).unwrap_or(0) as u8)
 }
 
+/// The last signed transactions, newest first: what left the wallet and where it stands.
+fn draw_activity(g: &Gfx, s: &State, sel: u8) {
+    g.title("Activity");
+    wifi_badge(g, s);
+    g.font(Font::Small);
+    if s.activity.is_empty() {
+        g.center(30, "No transaction today:");
+        g.center(41, "they show here once signed");
+        g.hints("Back", "");
+        return;
+    }
+    // Four rows fit; the selected one stays in view.
+    let first = sel.saturating_sub(3) as usize;
+    for (row, t) in s.activity.iter().enumerate().skip(first).take(4) {
+        let y = 22 + (row - first) as i32 * 11;
+        if row == sel as usize {
+            g.fill(0, y - 9, 128, 11);
+            g.white();
+        }
+        g.text(2, y, &["-", &zec(t.amount)].concat());
+        g.right(126, y, &status(t.tx));
+        g.black();
+    }
+}
+
+/// A transaction's state in a few characters.
+fn status(tx: wifi::Tx) -> String {
+    match tx {
+        wifi::Tx::Mined { confirmations, .. } if confirmations >= SETTLED => "done".into(),
+        wifi::Tx::Mined { confirmations, .. } => [num(confirmations as u64).as_str(), "/", &num(SETTLED as u64)].concat(),
+        wifi::Tx::Mempool => "mempool".into(),
+        wifi::Tx::Unknown => "not sent".into(),
+        _ => "...".into(),
+    }
+}
+
+fn load_activity() -> Vec<Track> {
+    let mut out = Vec::new();
+    let today = now_secs();
+    let Ok(mut f) = OpenOptions::new().read(true).open_existing(true).open(ACTIVITY_PATH) else { return out };
+    let mut r = [0u8; ACTIVITY_RECORD];
+    while out.len() < ACTIVITY_MAX && f.read(&mut r).ok() == Some(ACTIVITY_RECORD) {
+        let word = |i: usize| u32::from_le_bytes([r[i], r[i + 1], r[i + 2], r[i + 3]]);
+        let signed_at = word(40);
+        if !same_day(signed_at, today) {
+            continue;
+        }
+        let tx = match r[44] {
+            1 => wifi::Tx::Unknown,
+            2 => wifi::Tx::Mempool,
+            3 => wifi::Tx::Mined { height: word(45), confirmations: word(49) },
+            _ => wifi::Tx::Asking,
+        };
+        let mut txid = [0u8; 32];
+        txid.copy_from_slice(&r[..32]);
+        let mut amount = [0u8; 8];
+        amount.copy_from_slice(&r[32..40]);
+        out.push(Track { txid, amount: u64::from_le_bytes(amount), signed_at, tx, asked: 0 });
+    }
+    drop(f);
+    // Older days go from the card too.
+    save_activity(&out);
+    out
+}
+
+fn now_secs() -> u32 {
+    unsafe { sys::furi_hal_rtc_get_timestamp() }
+}
+
+/// Whether two of the Flipper's (local) timestamps fall on the same day.
+fn same_day(a: u32, b: u32) -> bool {
+    a / 86_400 == b / 86_400
+}
+
+fn save_activity(list: &[Track]) {
+    let Ok(mut f) = OpenOptions::new().write(true).create_always(true).open(ACTIVITY_PATH) else { return };
+    for t in list {
+        let mut r = [0u8; ACTIVITY_RECORD];
+        r[..32].copy_from_slice(&t.txid);
+        r[32..40].copy_from_slice(&t.amount.to_le_bytes());
+        r[40..44].copy_from_slice(&t.signed_at.to_le_bytes());
+        let (kind, height, confirmations) = match t.tx {
+            wifi::Tx::Unknown => (1, 0, 0),
+            wifi::Tx::Mempool => (2, 0, 0),
+            wifi::Tx::Mined { height, confirmations } => (3, height, confirmations),
+            _ => (0, 0, 0),
+        };
+        r[44] = kind;
+        r[45..49].copy_from_slice(&height.to_le_bytes());
+        r[49..53].copy_from_slice(&confirmations.to_le_bytes());
+        let _ = f.write(&r);
+    }
+}
+
 fn settled(t: &Track) -> bool {
     matches!(t.tx, wifi::Tx::Mined { confirmations, .. } if confirmations >= SETTLED)
 }
 
-/// The Wi-Fi board, as the Wi-Fi fan left of the Bluetooth rune: whole once online,
+/// The Wi-Fi board, as the Wi-Fi fan in the title bar's right corner: whole once online,
 /// its inner arc blinking while it joins, the dot alone without a network.
 fn wifi_badge(g: &Gfx, s: &State) {
     let Some(net) = s.wifi else { return };
     g.white();
-    let (cx, y) = (108, 9);
+    let (cx, y) = (120, 9);
     g.dot(cx, y);
     let arcs = match net {
         wifi::Net::Online => 3,
@@ -1054,7 +1208,7 @@ fn wifi_badge(g: &Gfx, s: &State) {
 fn draw_track(g: &Gfx, s: &State) {
     g.title("Transaction");
     wifi_badge(g, s);
-    let Some(t) = &s.track else { return };
+    let Some(t) = s.activity.get(s.shown) else { return };
     let (lines, mined): ([&str; 2], Option<(u32, u32)>) = match (s.wifi, t.tx) {
         (Some(net), _) if net != wifi::Net::Online => (
             [

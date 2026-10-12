@@ -71,10 +71,19 @@ struct Shared {
     nvs: Mutex<EspNvs<NvsDefault>>,
 }
 
-fn main() -> Result<()> {
+fn main() {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    // Never return: a silent board looks unplugged. Keep telling (on the USB log) why.
+    if let Err(e) = run() {
+        loop {
+            log::error!("stopped: {e:?}");
+            thread::sleep(Duration::from_secs(2));
+        }
+    }
+}
 
+fn run() -> Result<()> {
     let p = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;
     let partition = EspDefaultNvsPartition::take()?;
@@ -95,22 +104,41 @@ fn main() -> Result<()> {
         creds: AtomicU32::new(0),
         nvs: Mutex::new(nvs),
     });
-    let wifi = BlockingWifi::wrap(EspWifi::new(p.modem, sysloop.clone(), Some(partition))?, sysloop)?;
-    {
-        let shared = shared.clone();
-        thread::Builder::new().stack_size(8192).spawn(move || wifi_thread(wifi, &shared))?;
+    // Without Wi-Fi the board still answers the Flipper (as "failed").
+    match EspWifi::new(p.modem, sysloop.clone(), Some(partition)).and_then(|w| BlockingWifi::wrap(w, sysloop)) {
+        Ok(wifi) => {
+            let shared = shared.clone();
+            thread::Builder::new().stack_size(8192).spawn(move || wifi_thread(wifi, &shared))?;
+        }
+        Err(e) => {
+            log::error!("Wi-Fi: {e:?}");
+            *shared.net.lock().unwrap() = Net::Failed;
+        }
     }
 
     info!("ZFirm Wi-Fi board {VERSION} ready");
     let mut line = Vec::with_capacity(128);
     let mut buf = [0u8; 64];
+    let mut heard = 0usize;
+    let mut last_hello = std::time::Instant::now();
     loop {
-        let n = link.read(&mut buf, 10)?;
+        let n = link.read(&mut buf, 10).unwrap_or(0);
+        heard += n;
+        // Announce itself every two seconds, so the Flipper finds it even before asking.
+        if last_hello.elapsed() >= Duration::from_secs(2) {
+            last_hello = std::time::Instant::now();
+            let net = *shared.net.lock().unwrap();
+            let _ = link.write(format!("ZF {VERSION} {}\n", net.word()).as_bytes());
+            info!("alive: {heard} bytes heard from the Flipper, Wi-Fi {}", net.word());
+        }
         for &b in &buf[..n] {
             match b {
                 b'\n' | b'\r' => {
                     if !line.is_empty() {
-                        let reply = handle(&String::from_utf8_lossy(&line), &shared);
+                        let text = String::from_utf8_lossy(&line);
+                        // Never log a WIFI line: it carries the password.
+                        info!("from the Flipper: {}", if text.starts_with("WIFI ") { "WIFI (hidden)" } else { &text });
+                        let reply = handle(&text, &shared);
                         if let Some(reply) = reply {
                             link.write(reply.as_bytes())?;
                             link.write(b"\n")?;
